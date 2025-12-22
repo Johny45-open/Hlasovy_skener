@@ -2,20 +2,42 @@ import sys
 import tempfile
 import os
 import io
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel,
     QComboBox, QSpinBox, QMessageBox, QFileDialog, QDialog,
     QProgressDialog
 )
 from PyQt6.QtGui import QPixmap
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEventLoop
 from PIL import Image, ImageQt
 import pytesseract
 import comtypes.client
 from docx import Document
 import fitz  # PyMuPDF
+from gtts import gTTS
+import pygame
 
+# ------------------ Hlasový výstup ------------------
+def speak(text, lang="cs"):
+    """Spustí hlasový výstup ve vlákně."""
+    def _speak():
+        try:
+            tts = gTTS(text=text, lang=lang)
+            mp3_fp = io.BytesIO()
+            tts.write_to_fp(mp3_fp)
+            mp3_fp.seek(0)
+            pygame.mixer.init()
+            pygame.mixer.music.load(mp3_fp, "mp3")
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+            pygame.mixer.quit()
+        except Exception as e:
+            print("Chyba při hlasovém výstupu:", e)
+    threading.Thread(target=_speak, daemon=True).start()
 
+# ------------------ WIA skener ------------------
 class WIAScanner:
     def __init__(self):
         self.dm = comtypes.client.CreateObject("WIA.DeviceManager")
@@ -43,36 +65,22 @@ class WIAScanner:
                     return True
             return False
 
-        set_prop("6147", dpi)  # Horizontal Resolution
-        set_prop("6148", dpi)  # Vertical Resolution
-
+        set_prop("6147", dpi)
+        set_prop("6148", dpi)
         source_val = 1 if source == "Sklo" else 2
         set_prop("6146", source_val)
-
-        set_prop("6151", color_mode)  # Color Mode
+        set_prop("6151", color_mode)
 
         item = self.device.Items[1]
         image = item.Transfer()
 
-        # Bezpečný temp soubor bmp
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bmp") as tmp_bmp:
-            temp_path_bmp = tmp_bmp.name
-
-        # Ujisti se, že soubor neexistuje
-        if os.path.exists(temp_path_bmp):
-            os.remove(temp_path_bmp)
-
-        image.SaveFile(temp_path_bmp)
-
-        # Otevři, přeulož a zkopíruj PIL obrázek
-        with Image.open(temp_path_bmp) as img:
-            pil_img = img.copy()
-
-        os.remove(temp_path_bmp)
-
+        with tempfile.NamedTemporaryFile(suffix=".bmp") as tmp:
+            image.SaveFile(tmp.name)
+            with Image.open(tmp.name) as img:
+                pil_img = img.copy()
         return pil_img
 
-
+# ------------------ Náhled dialog ------------------
 class PreviewDialog(QDialog):
     def __init__(self, pil_img):
         super().__init__()
@@ -82,7 +90,6 @@ class PreviewDialog(QDialog):
         self.label = QLabel()
         self.label.setAccessibleName("Náhled naskenované stránky")
         self.label.setAccessibleDescription("Zobrazení naskenované stránky, lze otočit")
-
         self.update_image()
 
         btn_rotate = QPushButton("Otočit")
@@ -110,7 +117,26 @@ class PreviewDialog(QDialog):
         self.image = self.image.rotate(-90, expand=True)
         self.update_image()
 
+# ------------------ Vlákno skenování ------------------
+class ScanThread(QThread):
+    finished = pyqtSignal(object)  # PIL obrázek
+    error = pyqtSignal(str)
 
+    def __init__(self, scanner, dpi, color_mode, source):
+        super().__init__()
+        self.scanner = scanner
+        self.dpi = dpi
+        self.color_mode = color_mode
+        self.source = source
+
+    def run(self):
+        try:
+            img = self.scanner.scan(dpi=self.dpi, color_mode=self.color_mode, source=self.source)
+            self.finished.emit(img)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ------------------ Vlákno OCR ------------------
 class OCRThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
@@ -129,11 +155,11 @@ class OCRThread(QThread):
             self.progress.emit(int((i + 1) / total * 100))
         self.finished.emit(full_text)
 
-
+# ------------------ Hlavní aplikace ------------------
 class ScanApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WIA skener + OCR")
+        self.setWindowTitle("WIA skener + OCR + hlas")
         self.scanner = WIAScanner()
         self.scanned_images = []
 
@@ -142,7 +168,6 @@ class ScanApp(QWidget):
         self.device_combo = QComboBox()
         self.device_combo.setAccessibleName("Výběr skeneru")
         self.device_combo.setAccessibleDescription("Vyber svůj připojený skener")
-
         self.reload_devices()
 
         self.source_combo = QComboBox()
@@ -200,6 +225,7 @@ class ScanApp(QWidget):
         self.ocr_thread = None
         self.progress_dialog = None
 
+    # ------------------ Skenery ------------------
     def reload_devices(self):
         try:
             devices = self.scanner.list_devices()
@@ -211,6 +237,7 @@ class ScanApp(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Chyba", f"Nenašel jsem žádný skener:\n{e}")
 
+    # ------------------ Skenování ------------------
     def scan_pages(self):
         self.scanned_images.clear()
         while True:
@@ -240,28 +267,48 @@ class ScanApp(QWidget):
         color_text = self.color_combo.currentText()
         color_mode = 1 if color_text == "Barevný" else 2 if color_text == "Šedý" else 4
 
-        progress = QProgressDialog("Probíhá skenování...", "Zrušit", 0, 0, self)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setCancelButton(None)
-        progress.show()
+        self.progress_dialog = QProgressDialog("Probíhá skenování...", "Zrušit", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.canceled.connect(self.cancel_scan)
+        self.progress_dialog.show()
 
-        try:
-            pil_img = self.scanner.scan(dpi=dpi, color_mode=color_mode, source=source)
-        except Exception as e:
-            progress.cancel()
-            QMessageBox.critical(self, "Chyba", f"Chyba při skenování:\n{e}")
-            return False
+        # Spustíme vlákno
+        self.scan_thread = ScanThread(self.scanner, dpi, color_mode, source)
+        self.scan_thread.finished.connect(self.scan_finished)
+        self.scan_thread.error.connect(self.scan_error)
+        self.scan_thread.start()
 
-        progress.cancel()
+        # Modalní loop dokud neskončí sken
+        loop = QEventLoop()
+        self.scan_thread.finished.connect(loop.quit)
+        self.scan_thread.error.connect(loop.quit)
+        loop.exec()
 
-        preview = PreviewDialog(pil_img)
+        return hasattr(self, 'last_scanned_image')
+
+    def scan_finished(self, img):
+        self.progress_dialog.cancel()
+        preview = PreviewDialog(img)
         if preview.exec():
             self.scanned_images.append(preview.image)
+            self.last_scanned_image = True
+            speak("Stránka naskenována a upravena")
             QMessageBox.information(self, "Hotovo", "Stránka naskenována a upravena.")
-            return True
-        return False
+        else:
+            self.last_scanned_image = False
 
+    def scan_error(self, msg):
+        self.progress_dialog.cancel()
+        QMessageBox.critical(self, "Chyba", f"Chyba při skenování:\n{msg}")
+        self.last_scanned_image = False
+
+    def cancel_scan(self):
+        if hasattr(self, 'scan_thread') and self.scan_thread.isRunning():
+            self.scan_thread.terminate()
+            QMessageBox.information(self, "Zrušeno", "Skenování bylo zrušeno uživatelem.")
+
+    # ------------------ OCR ------------------
     def run_ocr(self):
         if not self.scanned_images:
             QMessageBox.information(self, "Info", "Nejsou žádné naskenované stránky.")
@@ -297,15 +344,17 @@ class ScanApp(QWidget):
             else:
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(full_text)
+                speak("OCR uloženo do TXT")
                 QMessageBox.information(self, "Hotovo", "OCR uložen do TXT.")
         except Exception as e:
             QMessageBox.critical(self, "Chyba", f"Chyba při ukládání:\n{e}")
 
+    # ------------------ Uložení PDF ------------------
     def save_pdf(self, full_text, path):
         try:
             dpi = self.dpi_spin.value()
             doc = fitz.open()
-            max_width = 1200  # max šířka obrázku v pixelech
+            max_width = 1200
 
             for i, img in enumerate(self.scanned_images):
                 if img.width > max_width:
@@ -321,19 +370,14 @@ class ScanApp(QWidget):
                 height_pt = img_resized.height / dpi_adj * 72
                 page = doc.new_page(width=width_pt, height=height_pt)
 
-                # Automatický výpočet JPEG kvality
                 img_byte_arr = io.BytesIO()
                 img_resized.save(img_byte_arr, format="JPEG", quality=100)
                 size_kb = len(img_byte_arr.getvalue()) / 1024
 
-                if size_kb > 500:
-                    jpeg_quality = 50
-                elif size_kb > 300:
-                    jpeg_quality = 60
-                elif size_kb > 200:
-                    jpeg_quality = 70
-                else:
-                    jpeg_quality = 85
+                jpeg_quality = 85
+                if size_kb > 500: jpeg_quality = 50
+                elif size_kb > 300: jpeg_quality = 60
+                elif size_kb > 200: jpeg_quality = 70
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_jpg:
                     img_resized.save(temp_jpg.name, format="JPEG", quality=jpeg_quality)
@@ -362,16 +406,19 @@ class ScanApp(QWidget):
                 os.unlink(temp_jpg_path)
 
             doc.save(path)
+            speak("OCR + obrázek uložen do PDF")
             QMessageBox.information(self, "Hotovo", "OCR + obrázek uložen do prohledávatelného PDF.")
         except Exception as e:
             QMessageBox.critical(self, "Chyba", f"Nepodařilo se uložit PDF:\n{e}")
 
+    # ------------------ Uložení DOCX ------------------
     def save_docx(self, text, path):
         doc = Document()
         for part in text.split("\n\n"):
             doc.add_paragraph(part)
             doc.add_page_break()
         doc.save(path)
+        speak("OCR uložen do DOCX")
         QMessageBox.information(self, "Hotovo", "OCR uložen do DOCX.")
 
 
