@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QThread, pyqtSignal
-from paddleocr import PaddleOCR
+import pytesseract
 import numpy as np
 
 class OCRThread(QThread):
@@ -11,30 +11,36 @@ class OCRThread(QThread):
     def __init__(self, images, lang_code):
         super().__init__()
         self.images = images
-        # PaddleOCR používá kódy jako 'cs', 'en' atd.
-        self.lang_code = lang_code.split()[0].replace("ces", "cs").replace("eng", "en")
-        self.ocr = PaddleOCR(use_angle_cls=True, lang=self.lang_code)
+        # pytesseract používá ISO 639-2 kódy jako 'ces', 'eng' atd.
+        self.lang_code = lang_code.split()[0]
 
     def run(self):
         full_text = ""
         results_list = []
         total = len(self.images)
         for i, img in enumerate(self.images):
-            # PaddleOCR očekává obrázek jako numpy array (z PIL)
-            img_np = np.array(img)
-            result = self.ocr.ocr(img_np, cls=True)
+            # Pytesseract očekává obrázek jako PIL Image
+            text = pytesseract.image_to_string(img, lang=self.lang_code)
             
-            page_text = ""
+            # Pro PDF generování potřebujeme boxy, tedy image_to_data
+            data = pytesseract.image_to_data(img, lang=self.lang_code, output_type=pytesseract.Output.DICT)
+            
             page_results = []
+            # Zpracování data pro extrakci bboxů a textu
+            n_boxes = len(data['text'])
+            for j in range(n_boxes):
+                if int(data['conf'][j]) > 0: # Pokud je nějaký text detekován
+                    text_content = data['text'][j]
+                    if text_content.strip():
+                        bbox = [
+                            [data['left'][j], data['top'][j]],
+                            [data['left'][j] + data['width'][j], data['top'][j]],
+                            [data['left'][j] + data['width'][j], data['top'][j] + data['height'][j]],
+                            [data['left'][j], data['top'][j] + data['height'][j]]
+                        ]
+                        page_results.append({'bbox': bbox, 'text': text_content})
             
-            # PaddleOCR result je seznam detekcí pro jednu stránku
-            for line in result[0]:
-                bbox = line[0]  # [[x1, y1], [x2, y2], ...]
-                text, score = line[1]
-                page_text += text + "\n"
-                page_results.append({'bbox': bbox, 'text': text})
-            
-            full_text += f"--- Stránka {i+1} ---\n{page_text}\n\n"
+            full_text += f"--- Stránka {i+1} ---\n{text}\n\n"
             results_list.append(page_results)
             
             self.progress.emit(int((i + 1) / total * 100))

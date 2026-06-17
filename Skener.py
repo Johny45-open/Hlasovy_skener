@@ -15,29 +15,18 @@ from docx import Document
 import fitz
 from gtts import gTTS
 import pygame
+from accessible_output2.outputs.auto import Auto
 
-from scanner_engine import WIAScanner, ScanThread
+# Importy z vlastních modulů
+from scanner_engine import NAPS2Scanner, ScanThread
 from ocr_engine import OCRThread
 
 # ------------------ Hlasový výstup ------------------
-def speak(text, lang="cs"):
-    """Spustí hlasový výstup ve vlákně."""
-    def _speak():
-        try:
-            tts = gTTS(text=text, lang=lang)
-            mp3_fp = io.BytesIO()
-            tts.write_to_fp(mp3_fp)
-            mp3_fp.seek(0)
-            pygame.mixer.init()
-            pygame.mixer.music.load(mp3_fp, "mp3")
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            pygame.mixer.quit()
-        except Exception as e:
-            print("Chyba při hlasovém výstupu:", e)
-    threading.Thread(target=_speak, daemon=True).start()
+speaker = Auto()
 
+def speak(text, lang="cs"):
+    """Spustí hlasový výstup přes systémový screen reader."""
+    speaker.output(text)
 # ------------------ Náhled dialog ------------------
 class PreviewDialog(QDialog):
     def __init__(self, pil_img):
@@ -73,8 +62,8 @@ class PreviewDialog(QDialog):
 class ScanApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WIA skener + OCR + hlas")
-        self.scanner = WIAScanner()
+        self.setWindowTitle("NAPS2 skener + OCR + hlas")
+        self.scanner = NAPS2Scanner()
         self.scanned_images = []
         self.last_ocr_results = []
 
@@ -101,7 +90,7 @@ class ScanApp(QWidget):
 
         layout.addWidget(QLabel("Jazyk OCR:"))
         layout.addWidget(self.lang_combo)
-        layout.addWidget(QLabel("Vyber skener:"))
+        layout.addWidget(QLabel("Vyber profil NAPS2:"))
         layout.addWidget(self.device_combo)
         layout.addWidget(QLabel("Zdroj papíru:"))
         layout.addWidget(self.source_combo)
@@ -126,9 +115,11 @@ class ScanApp(QWidget):
             devices = self.scanner.list_devices()
             self.device_combo.clear()
             for d in devices:
-                self.device_combo.addItem(d.Properties["Name"].Value)
+                self.device_combo.addItem(d)
             if devices:
-                self.scanner.connect_device(0)
+                self.scanner.connect_device(devices[0])
+            elif not self.scanner.naps2_exe:
+                QMessageBox.warning(self, "NAPS2 nenalezen", "NAPS2.Console.exe nebyl nalezen. Ujistěte se, že je NAPS2 nainstalován.")
         except Exception as e:
             QMessageBox.critical(self, "Chyba", f"Nenašel jsem žádný skener:\n{e}")
 
@@ -137,25 +128,35 @@ class ScanApp(QWidget):
         while True:
             if not self.scan_page_single():
                 break
-            if QMessageBox.question(self, "Další", "Další stránka?") != QMessageBox.StandardButton.Yes:
+            
+            # Vlastní dialog pro lokalizaci tlačítek
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Další")
+            msg.setText("Další stránka?")
+            btn_yes = msg.addButton("Ano", QMessageBox.ButtonRole.YesRole)
+            btn_no = msg.addButton("Ne", QMessageBox.ButtonRole.NoRole)
+            msg.exec()
+            
+            if msg.clickedButton() != btn_yes:
                 break
         if self.scanned_images:
             self.btn_ocr.setEnabled(True)
 
     def scan_page_single(self):
-        index = self.device_combo.currentIndex()
-        try:
-            self.scanner.connect_device(index)
-        except Exception as e:
-            QMessageBox.critical(self, "Chyba", f"Nelze připojit ke skeneru:\n{e}")
+        device_name = self.device_combo.currentText()
+        if not device_name:
+            QMessageBox.warning(self, "Chyba", "Není vybrán žádný skener.")
             return False
+            
+        self.scanner.connect_device(device_name)
 
         dpi = self.dpi_spin.value()
         source = self.source_combo.currentText()
         color_text = self.color_combo.currentText()
-        color_mode = 1 if color_text == "Barevný" else 2 if color_text == "Šedý" else 4
+        # NAPS2 používá: Color, Grayscale, BlackWhite
+        color_mode = "Color" if color_text == "Barevný" else "Grayscale" if color_text == "Šedý" else "BlackWhite"
 
-        self.progress_dialog = QProgressDialog("Skenuji...", "Zrušit", 0, 0, self)
+        self.progress_dialog = QProgressDialog("Skenuji (přes NAPS2)...", "Zrušit", 0, 0, self)
         self.progress_dialog.show()
 
         self.scan_thread = ScanThread(self.scanner, dpi, color_mode, source)
@@ -164,9 +165,10 @@ class ScanApp(QWidget):
 
         loop = QEventLoop()
         self.scan_thread.finished.connect(loop.quit)
+        self.scan_thread.finished.connect(self.progress_dialog.cancel)
         loop.exec()
 
-        return hasattr(self, 'last_scanned_image')
+        return hasattr(self, 'last_scanned_image') and self.last_scanned_image
 
     def scan_finished(self, img):
         self.progress_dialog.cancel()
@@ -178,7 +180,7 @@ class ScanApp(QWidget):
             self.last_scanned_image = False
 
     def run_ocr(self):
-        self.progress_dialog = QProgressDialog("Probíhá OCR (PaddleOCR)...", "Zrušit", 0, 100, self)
+        self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
         self.progress_dialog.show()
 
         lang = self.lang_combo.currentText()
