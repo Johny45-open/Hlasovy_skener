@@ -131,6 +131,7 @@ class ScanApp(QWidget):
             QMessageBox.critical(self, "Chyba", f"Nenašel jsem žádný skener:\n{e}")
 
     def scan_pages(self):
+        speak("Zahajuji skenování.")
         self.scanned_images.clear()
         while True:
             if not self.scan_page_single():
@@ -146,6 +147,8 @@ class ScanApp(QWidget):
             
             if msg.clickedButton() != btn_yes:
                 break
+        
+        speak("Skenování dokončeno.")
         if self.scanned_images:
             self.btn_ocr.setEnabled(True)
 
@@ -187,6 +190,7 @@ class ScanApp(QWidget):
             self.last_scanned_image = False
 
     def run_ocr(self):
+        speak("Zahajuji OCR.")
         self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
         self.progress_dialog.show()
 
@@ -201,6 +205,7 @@ class ScanApp(QWidget):
 
     def ocr_finished(self, full_text):
         self.progress_dialog.cancel()
+        speak("OCR dokončeno. Vyberte umístění pro uložení souboru.")
         path, _ = QFileDialog.getSaveFileName(self, "Uložit", "", "Text (*.txt);;PDF (*.pdf);;Word (*.docx)")
         if not path: return
 
@@ -211,6 +216,7 @@ class ScanApp(QWidget):
         else:
             with open(path, "w", encoding="utf-8") as f: f.write(full_text)
             QMessageBox.information(self, "Hotovo", "Uloženo.")
+            speak("Soubor byl úspěšně uložen.")
 
     def save_pdf(self, path):
         doc = fitz.open()
