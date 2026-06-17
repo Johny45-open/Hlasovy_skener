@@ -83,6 +83,7 @@ class ScanApp(QWidget):
         self.color_combo.addItems(["Barevný", "Šedý", "ČB"])
 
         self.lang_combo = QComboBox()
+        self.lang_combo.setAccessibleName("Jazyk OCR")
         self.lang_combo.addItems([
             "ces (Čeština)", "eng (Angličtina)", "deu (Němčina)",
             "fra (Francouzština)", "ita (Italština)", "pol (Polština)"
@@ -91,19 +92,25 @@ class ScanApp(QWidget):
         layout.addWidget(QLabel("Jazyk OCR:"))
         layout.addWidget(self.lang_combo)
         layout.addWidget(QLabel("Vyber profil NAPS2:"))
+        self.device_combo.setAccessibleName("Vyber profil NAPS2")
         layout.addWidget(self.device_combo)
         layout.addWidget(QLabel("Zdroj papíru:"))
+        self.source_combo.setAccessibleName("Zdroj papíru")
         layout.addWidget(self.source_combo)
         layout.addWidget(QLabel("Rozlišení DPI:"))
+        self.dpi_spin.setAccessibleName("Rozlišení DPI")
         layout.addWidget(self.dpi_spin)
         layout.addWidget(QLabel("Režim:"))
+        self.color_combo.setAccessibleName("Režim barev")
         layout.addWidget(self.color_combo)
         
         self.btn_scan = QPushButton("Skenovat stránku")
+        self.btn_scan.setAccessibleName("Skenovat stránku")
         self.btn_scan.clicked.connect(self.scan_pages)
         layout.addWidget(self.btn_scan)
 
         self.btn_ocr = QPushButton("Spustit OCR a uložit")
+        self.btn_ocr.setAccessibleName("Spustit OCR a uložit")
         self.btn_ocr.clicked.connect(self.run_ocr)
         self.btn_ocr.setEnabled(False)
         layout.addWidget(self.btn_ocr)
