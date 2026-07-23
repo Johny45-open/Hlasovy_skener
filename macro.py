@@ -83,6 +83,14 @@ class MacroManager:
             json.dump(data, f, indent=2, ensure_ascii=False)
         macro.file_path = fpath
 
+    def rename(self, macro: Macro, new_name: str) -> None:
+        old_path = macro.file_path
+        macro.name = new_name
+        macro.file_path = ""
+        self.save(macro)
+        if old_path and os.path.exists(old_path) and old_path != macro.file_path:
+            os.remove(old_path)
+
     def delete(self, macro: Macro) -> None:
         if macro.file_path and os.path.exists(macro.file_path):
             os.remove(macro.file_path)

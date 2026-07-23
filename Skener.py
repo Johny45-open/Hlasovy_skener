@@ -7,7 +7,8 @@ from typing import Optional, Callable
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QSpinBox, QMessageBox, QFileDialog, QDialog, QListWidget,
-    QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox
+    QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox,
+    QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer
@@ -711,13 +712,33 @@ class ScanApp(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         for macro in self.macro_manager.macros:
+            container = QWidget()
+            row = QHBoxLayout(container)
+            row.setContentsMargins(0, 0, 0, 0)
             label = macro.name
             if macro.shortcut:
                 label += f" ({macro.shortcut})"
-            btn = QPushButton(label)
-            btn.setAccessibleName(f"Spustit makro: {macro.name}")
-            btn.clicked.connect(lambda checked, m=macro: self._run_macro(m))
-            self._macro_buttons_layout.addWidget(btn)
+            btn_run = QPushButton(label)
+            btn_run.setAccessibleName(f"Spustit makro: {macro.name}")
+            btn_run.clicked.connect(lambda checked, m=macro: self._run_macro(m))
+            row.addWidget(btn_run)
+
+            btn_edit = QPushButton("Upravit")
+            btn_edit.setAccessibleName(f"Upravit makro: {macro.name}")
+            btn_edit.clicked.connect(lambda checked, m=macro: self._open_macro_editor(m))
+            row.addWidget(btn_edit)
+
+            btn_rename = QPushButton("Přejmenovat")
+            btn_rename.setAccessibleName(f"Přejmenovat makro: {macro.name}")
+            btn_rename.clicked.connect(lambda checked, m=macro: self._rename_macro(m))
+            row.addWidget(btn_rename)
+
+            btn_delete = QPushButton("Smazat")
+            btn_delete.setAccessibleName(f"Smazat makro: {macro.name}")
+            btn_delete.clicked.connect(lambda checked, m=macro: self._delete_macro(m))
+            row.addWidget(btn_delete)
+
+            self._macro_buttons_layout.addWidget(container)
 
     def _open_macro_editor(self, macro: Optional[Macro] = None) -> None:
         dialog = MacroEditorDialog(self, self.macro_manager, macro)
@@ -727,6 +748,32 @@ class ScanApp(QWidget):
         self.speak(f"Spouštím makro: {macro.name}")
         self._macro_runner.run(macro)
         self.speak("Makro dokončeno.")
+
+    def _rename_macro(self, macro: Macro) -> None:
+        new_name, ok = QInputDialog.getText(
+            self, "Přejmenovat makro", "Nový název makra:",
+            text=macro.name,
+        )
+        if ok and new_name.strip():
+            self.macro_manager.rename(macro, new_name.strip())
+            self.macro_manager.load_all()
+            self._rebuild_macro_buttons()
+            self.speak(f"Makro přejmenováno na {new_name.strip()}")
+
+    def _delete_macro(self, macro: Macro) -> None:
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Smazat makro")
+        msg.setText(f"Opravdu chcete smazat makro {macro.name}?")
+        msg.setInformativeText("Tuto akci nelze vrátit.")
+        btn_yes = msg.addButton("Ano", QMessageBox.ButtonRole.YesRole)
+        btn_yes.setAccessibleName(f"Ano, smazat makro {macro.name}")
+        btn_no = msg.addButton("Ne", QMessageBox.ButtonRole.NoRole)
+        btn_no.setAccessibleName("Ne, ponechat makro")
+        msg.exec()
+        if msg.clickedButton() == btn_yes:
+            self.macro_manager.delete(macro)
+            self._rebuild_macro_buttons()
+            self.speak(f"Makro {macro.name} smazáno.")
 
 
 if __name__ == "__main__":
