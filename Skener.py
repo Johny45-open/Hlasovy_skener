@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QSpinBox, QMessageBox, QFileDialog, QDialog, QListWidget,
     QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox,
-    QInputDialog
+    QInputDialog, QScrollArea
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer
@@ -151,7 +151,14 @@ class ScanApp(QWidget):
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        layout = QVBoxLayout()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(12)
+        layout.setContentsMargins(15, 15, 15, 15)
 
         # -- Nastavení OCR --
         ocr_group = QGroupBox("OCR")
@@ -295,7 +302,16 @@ class ScanApp(QWidget):
         macro_group.setLayout(self._macro_container)
         layout.addWidget(macro_group)
 
-        self.setLayout(layout)
+        scroll.setWidget(container)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(scroll)
+        self.setLayout(main_layout)
+        self.setStyleSheet("""
+            QComboBox, QSpinBox, QPushButton { padding: 6px; min-height: 1.5em; }
+            QGroupBox { margin-top: 1em; }
+        """)
         self._rebuild_macro_buttons()
 
         # -- Tab order --
@@ -778,6 +794,9 @@ class ScanApp(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    font = app.font()
+    font.setPointSize(11)
+    app.setFont(font)
     win = ScanApp()
     win.show()
     sys.exit(app.exec())

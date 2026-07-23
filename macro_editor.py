@@ -46,6 +46,7 @@ class MacroEditorDialog(QDialog):
     # ---------- UI ----------
     def _build_ui(self) -> None:
         layout = QVBoxLayout()
+        layout.setSpacing(10)
 
         # Název
         name_layout = QHBoxLayout()
