@@ -253,11 +253,12 @@ class ScanApp(QWidget):
             
             # Vložení skrytého textu pro vyhledávání
             for item in self.last_ocr_results[i]:
-                bbox = item['bbox']
-                x0, y0 = bbox[0][0], bbox[0][1]
-                x1, y1 = bbox[2][0], bbox[2][1]
-                rect = fitz.Rect(x0 / dpi * 72, y0 / dpi * 72, x1 / dpi * 72, y1 / dpi * 72)
-                page.insert_textbox(rect, item['text'], fontsize=0, fill_opacity=0)
+                if 'bbox' in item:
+                    bbox = item['bbox']
+                    x0, y0 = bbox[0][0], bbox[0][1]
+                    x1, y1 = bbox[2][0], bbox[2][1]
+                    rect = fitz.Rect(x0 / dpi * 72, y0 / dpi * 72, x1 / dpi * 72, y1 / dpi * 72)
+                    page.insert_textbox(rect, item['text'], fontsize=0, fill_opacity=0)
         
         doc.save(path)
         QMessageBox.information(self, "Hotovo", "PDF uloženo.")

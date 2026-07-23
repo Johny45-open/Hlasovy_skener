@@ -97,10 +97,35 @@ class EasyOCRThread(QThread):
 
             page_text = ""
             page_results = []
-            for text, conf in raw_results:
-                if text.strip():
-                    page_text += text + "\n"
-                    page_results.append({'text': text})
+            for result in raw_results:
+                if len(result) == 3:
+                    bbox, text, _ = result
+                    item = {'bbox': bbox, 'text': text}
+                else:
+                    word_results, _ = result
+                    if not isinstance(word_results, list) or not word_results:
+                        continue
+                    texts = []
+                    all_bboxes = []
+                    for word in word_results:
+                        if isinstance(word, (list, tuple)) and len(word) >= 3:
+                            texts.append(str(word[1]))
+                            all_bboxes.append(word[0])
+                    text = ' '.join(texts)
+                    if not text.strip():
+                        continue
+                    if all_bboxes:
+                        xs = [p[0] for b in all_bboxes for p in b]
+                        ys = [p[1] for b in all_bboxes for p in b]
+                        bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                                [max(xs), max(ys)], [min(xs), max(ys)]]
+                    else:
+                        bbox = None
+                    item = {'text': text}
+                    if bbox:
+                        item['bbox'] = bbox
+                page_text += text + "\n"
+                page_results.append(item)
 
             full_text += f"--- Stránka {i+1} ---\n{page_text}\n\n"
             results_list.append(page_results)
