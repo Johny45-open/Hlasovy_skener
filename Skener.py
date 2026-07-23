@@ -2,7 +2,7 @@ from __future__ import annotations
 import sys
 import os
 import tempfile
-from typing import Optional
+from typing import Optional, Callable
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -18,6 +18,8 @@ from accessible_output2.outputs.auto import Auto
 
 from scanner_engine import NAPS2Scanner, ScanThread
 from ocr_engine import create_ocr_thread, OcrResult
+from macro import Macro, MacroManager, PipelineRunner
+from macro_editor import MacroEditorDialog
 
 # ------------------ Hlasový výstup ------------------
 _speaker = Auto()
@@ -132,10 +134,19 @@ class ScanApp(QWidget):
         self.last_ocr_results: list[list[OcrResult]] = []
         self.last_scanned_image: Optional[bool] = None
         self._scan_cancelled = False
+        self._ocr_mode = "interactive"
+        self._last_text = ""
+
+        self.macro_manager = MacroManager()
+        self.macro_manager.load_all()
+        self._macro_runner = PipelineRunner(self)
 
         self._build_ui()
         self._setup_shortcuts()
         self._load_settings()
+
+    def speak(self, text: str) -> None:
+        speak(text)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -270,7 +281,21 @@ class ScanApp(QWidget):
         btn_export_img.clicked.connect(self.export_images)
         layout.addWidget(btn_export_img)
 
+        # -- Uživatelská makra --
+        macro_group = QGroupBox("Uživatelská makra")
+        macro_group.setAccessibleName("Uživatelská makra")
+        self._macro_container = QVBoxLayout()
+        self._macro_buttons_layout = QVBoxLayout()
+        self._macro_container.addLayout(self._macro_buttons_layout)
+        btn_edit_macros = QPushButton("Spravovat makra...")
+        btn_edit_macros.setAccessibleName("Otevřít editor maker")
+        btn_edit_macros.clicked.connect(self._open_macro_editor)
+        self._macro_container.addWidget(btn_edit_macros)
+        macro_group.setLayout(self._macro_container)
+        layout.addWidget(macro_group)
+
         self.setLayout(layout)
+        self._rebuild_macro_buttons()
 
         # -- Tab order --
         self.setTabOrder(self.lang_combo, self.engine_combo)
@@ -297,6 +322,13 @@ class ScanApp(QWidget):
         QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self.export_images)
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.close)
         QShortcut(QKeySequence("Delete"), self).activated.connect(self.delete_page)
+        QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self._open_macro_editor)
+        for macro in self.macro_manager.macros:
+            if macro.shortcut:
+                ks = QKeySequence(macro.shortcut)
+                QShortcut(ks, self).activated.connect(
+                    lambda checked, m=macro: self._run_macro(m)
+                )
 
     # ---------- Settings persistence ----------
     def _load_settings(self) -> None:
@@ -488,14 +520,19 @@ class ScanApp(QWidget):
         if not self.scanned_images:
             QMessageBox.warning(self, "Chyba", "Nejdříve naskenujte stránky.")
             return
-
         speak("Zahajuji OCR.")
+        self._ocr_mode = "interactive"
+        self._start_ocr()
+
+    def _start_ocr(self, on_done: Optional[Callable[[], None]] = None) -> None:
         lang = self.lang_combo.currentText()
         engine = self.engine_combo.currentText()
 
         self.ocr_thread = create_ocr_thread(engine, self.scanned_images, lang)
         self.ocr_thread.finished.connect(self._ocr_finished)
         self.ocr_thread.ocr_results.connect(self._set_ocr_results)
+        if on_done:
+            self.ocr_thread.finished.connect(on_done)
 
         if engine == "EasyOCR":
             self.progress_dialog = QProgressDialog(
@@ -510,6 +547,12 @@ class ScanApp(QWidget):
         self.ocr_thread.progress.connect(self._on_ocr_progress)
         self.progress_dialog.show()
         self.ocr_thread.start()
+
+    def _execute_ocr(self) -> None:
+        self._ocr_mode = "macro"
+        loop = QEventLoop()
+        self._start_ocr(on_done=loop.quit)
+        loop.exec()
 
     def _on_ocr_progress(self, value: int) -> None:
         self.progress_dialog.setValue(value)
@@ -529,15 +572,18 @@ class ScanApp(QWidget):
 
     def _ocr_finished(self, full_text: str) -> None:
         self.progress_dialog.cancel()
+        self._last_text = full_text
+        self.btn_read.setEnabled(True)
+        if self._ocr_mode == "interactive":
+            self._ocr_show_save_ui(full_text)
 
+    def _ocr_show_save_ui(self, full_text: str) -> None:
         speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit, přečíst nebo uložit.")
         dialog = OcrPreviewDialog(full_text, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-
         edited_text = dialog.get_text()
         self._last_text = edited_text
-        self.btn_read.setEnabled(True)
 
         speak("Vyberte umístění pro uložení souboru.")
         path, selected_filter = QFileDialog.getSaveFileName(
@@ -560,9 +606,8 @@ class ScanApp(QWidget):
             self.btn_scan.setFocus()
 
     def read_last_text(self) -> None:
-        text = getattr(self, '_last_text', None)
-        if text:
-            speak(text)
+        if self._last_text:
+            speak(self._last_text)
 
     # ---------- Export ----------
     def export_images(self) -> None:
@@ -658,6 +703,31 @@ class ScanApp(QWidget):
         QMessageBox.information(self, "Hotovo", "DOCX uloženo.")
         speak("Soubor uložen.")
         self.btn_scan.setFocus()
+
+    # ---------- Macros ----------
+    def _rebuild_macro_buttons(self) -> None:
+        while self._macro_buttons_layout.count():
+            item = self._macro_buttons_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for macro in self.macro_manager.macros:
+            label = macro.name
+            if macro.shortcut:
+                label += f" ({macro.shortcut})"
+            btn = QPushButton(label)
+            btn.setAccessibleName(f"Spustit makro: {macro.name}")
+            btn.clicked.connect(lambda checked, m=macro: self._run_macro(m))
+            self._macro_buttons_layout.addWidget(btn)
+
+    def _open_macro_editor(self, macro: Optional[Macro] = None) -> None:
+        dialog = MacroEditorDialog(self, self.macro_manager, macro)
+        dialog.exec()
+
+    def _run_macro(self, macro: Macro) -> None:
+        self.speak(f"Spouštím makro: {macro.name}")
+        self._macro_runner.run(macro)
+        self.speak("Makro dokončeno.")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
