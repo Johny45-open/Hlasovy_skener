@@ -97,10 +97,10 @@ class EasyOCRThread(QThread):
 
             page_text = ""
             page_results = []
-            for bbox, text, conf in raw_results:
+            for text, conf in raw_results:
                 if text.strip():
                     page_text += text + "\n"
-                    page_results.append({'bbox': bbox, 'text': text})
+                    page_results.append({'text': text})
 
             full_text += f"--- Stránka {i+1} ---\n{page_text}\n\n"
             results_list.append(page_results)
