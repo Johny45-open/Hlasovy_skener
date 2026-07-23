@@ -1,0 +1,8 @@
+PyQt6>=6.5
+Pillow>=10.0
+pytesseract>=0.3.10
+easyocr>=1.7
+python-docx>=1.0
+PyMuPDF>=1.23
+accessible-output2>=0.16
+numpy>=1.24

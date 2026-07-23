@@ -1,18 +1,29 @@
-from PyQt6.QtCore import QThread, pyqtSignal
-import pytesseract
-import numpy as np
-import easyocr
+import threading
 import os
+from dataclasses import dataclass
+from typing import Optional
 
-# Mapování kódů jazyků z Tesseract/UI do EasyOCR
+import numpy as np
+import pytesseract
+import easyocr
+from PIL import Image
+from PyQt6.QtCore import QThread, pyqtSignal
+
+
+@dataclass
+class OcrResult:
+    text: str
+    bbox: Optional[list[list[float]]] = None
+
+
 LANG_MAP_EASYOCR = {
-    "ces": "cs",
-    "eng": "en",
-    "deu": "de",
-    "fra": "fr",
-    "ita": "it",
-    "pol": "pl",
+    "ces": "cs", "eng": "en", "deu": "de",
+    "fra": "fr", "ita": "it", "pol": "pl",
 }
+
+
+def _extract_lang_code(lang_combo_text: str) -> str:
+    return lang_combo_text.split()[0]
 
 
 class TesseractThread(QThread):
@@ -20,75 +31,69 @@ class TesseractThread(QThread):
     finished = pyqtSignal(str)
     ocr_results = pyqtSignal(list)
 
-    def __init__(self, images, lang_code):
+    def __init__(self, images: list[Image.Image], lang_code: str) -> None:
         super().__init__()
         self.images = images
-        self.lang_code = lang_code.split()[0]
+        self.lang_code = _extract_lang_code(lang_code)
 
-    def run(self):
+    def run(self) -> None:
         full_text = ""
-        results_list = []
+        results_list: list[list[OcrResult]] = []
         total = len(self.images)
+
         for i, img in enumerate(self.images):
-            text = pytesseract.image_to_string(img, lang=self.lang_code)
+            data = pytesseract.image_to_data(
+                img, lang=self.lang_code, output_type=pytesseract.Output.DICT
+            )
 
-            data = pytesseract.image_to_data(img, lang=self.lang_code, output_type=pytesseract.Output.DICT)
-
-            page_results = []
-            n_boxes = len(data['text'])
+            page_results: list[OcrResult] = []
+            n_boxes = len(data["text"])
             for j in range(n_boxes):
-                if int(data['conf'][j]) > 0:
-                    text_content = data['text'][j]
-                    if text_content.strip():
-                        bbox = [
-                            [data['left'][j], data['top'][j]],
-                            [data['left'][j] + data['width'][j], data['top'][j]],
-                            [data['left'][j] + data['width'][j], data['top'][j] + data['height'][j]],
-                            [data['left'][j], data['top'][j] + data['height'][j]]
-                        ]
-                        page_results.append({'bbox': bbox, 'text': text_content})
+                conf = int(data["conf"][j])
+                if conf > 0 and data["text"][j].strip():
+                    x, y, w, h = (
+                        data["left"][j], data["top"][j],
+                        data["width"][j], data["height"][j],
+                    )
+                    bbox = [
+                        [float(x), float(y)],
+                        [float(x + w), float(y)],
+                        [float(x + w), float(y + h)],
+                        [float(x), float(y + h)],
+                    ]
+                    page_results.append(OcrResult(text=data["text"][j], bbox=bbox))
 
-            full_text += f"--- Stránka {i+1} ---\n{text}\n\n"
+            page_text = pytesseract.image_to_string(img, lang=self.lang_code)
+            full_text += f"--- Stránka {i + 1} ---\n{page_text}\n\n"
             results_list.append(page_results)
 
             self.progress.emit(int((i + 1) / total * 100))
 
-        self.finished.emit(full_text)
         self.ocr_results.emit(results_list)
+        self.finished.emit(full_text)
 
 
 class EasyOCRThread(QThread):
+    _lock = threading.Lock()
+    _reader = None
+    _reader_lang = None
+
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
     ocr_results = pyqtSignal(list)
     model_loading = pyqtSignal(int)
 
-    _reader = None
-    _reader_lang = None
-
-    def __init__(self, images, lang_code):
+    def __init__(self, images: list[Image.Image], lang_code: str) -> None:
         super().__init__()
         self.images = images
-        pyt_code = lang_code.split()[0]
+        pyt_code = _extract_lang_code(lang_code)
         self.lang_code = LANG_MAP_EASYOCR.get(pyt_code, pyt_code[:2])
 
-    def run(self):
-        if (EasyOCRThread._reader is None or
-                EasyOCRThread._reader_lang != [self.lang_code]):
-            self.model_loading.emit(0)
-            EasyOCRThread._reader = easyocr.Reader(
-                [self.lang_code],
-                gpu=False,
-                model_storage_directory=os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    ".easyocr_model"
-                )
-            )
-            EasyOCRThread._reader_lang = [self.lang_code]
-            self.model_loading.emit(100)
+    def run(self) -> None:
+        self._ensure_reader()
 
         full_text = ""
-        results_list = []
+        results_list: list[list[OcrResult]] = []
         total = len(self.images)
 
         for i, img in enumerate(self.images):
@@ -96,11 +101,11 @@ class EasyOCRThread(QThread):
             raw_results = EasyOCRThread._reader.readtext(img_np, paragraph=True)
 
             page_text = ""
-            page_results = []
+            page_results: list[OcrResult] = []
             for result in raw_results:
                 if len(result) == 3:
                     bbox, text, _ = result
-                    item = {'bbox': bbox, 'text': text}
+                    page_results.append(OcrResult(text=str(text), bbox=bbox))
                 else:
                     word_results, _ = result
                     if not isinstance(word_results, list) or not word_results:
@@ -111,37 +116,50 @@ class EasyOCRThread(QThread):
                         if isinstance(word, (list, tuple)) and len(word) >= 3:
                             texts.append(str(word[1]))
                             all_bboxes.append(word[0])
-                    text = ' '.join(texts)
+                    text = " ".join(texts)
                     if not text.strip():
                         continue
                     if all_bboxes:
                         xs = [p[0] for b in all_bboxes for p in b]
                         ys = [p[1] for b in all_bboxes for p in b]
-                        bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                                [max(xs), max(ys)], [min(xs), max(ys)]]
+                        bbox = [
+                            [min(xs), min(ys)], [max(xs), min(ys)],
+                            [max(xs), max(ys)], [min(xs), max(ys)],
+                        ]
                     else:
                         bbox = None
-                    item = {'text': text}
-                    if bbox:
-                        item['bbox'] = bbox
-                page_text += text + "\n"
-                page_results.append(item)
+                    page_results.append(OcrResult(text=text, bbox=bbox))
 
-            full_text += f"--- Stránka {i+1} ---\n{page_text}\n\n"
+                page_text += result[1] if len(result) == 3 else text + "\n"
+
+            full_text += f"--- Stránka {i + 1} ---\n{page_text}\n\n"
             results_list.append(page_results)
 
             self.progress.emit(int((i + 1) / total * 100))
 
-        self.finished.emit(full_text)
         self.ocr_results.emit(results_list)
+        self.finished.emit(full_text)
+
+    def _ensure_reader(self) -> None:
+        with EasyOCRThread._lock:
+            if EasyOCRThread._reader is None or \
+               EasyOCRThread._reader_lang != [self.lang_code]:
+                self.model_loading.emit(0)
+                EasyOCRThread._reader = easyocr.Reader(
+                    [self.lang_code],
+                    gpu=False,
+                    model_storage_directory=os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        ".easyocr_model",
+                    ),
+                )
+                EasyOCRThread._reader_lang = [self.lang_code]
+                self.model_loading.emit(100)
 
 
-# Zachování zpětné kompatibility
-OCRThread = TesseractThread
-
-
-def create_ocr_thread(engine, images, lang_code):
-    """Vrátí příslušný OCR thread podle zvoleného enginu."""
+def create_ocr_thread(
+    engine: str, images: list[Image.Image], lang_code: str
+) -> TesseractThread | EasyOCRThread:
     if engine == "EasyOCR":
         return EasyOCRThread(images, lang_code)
     return TesseractThread(images, lang_code)
