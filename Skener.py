@@ -19,7 +19,7 @@ from accessible_output2.outputs.auto import Auto
 
 # Importy z vlastních modulů
 from scanner_engine import NAPS2Scanner, ScanThread
-from ocr_engine import OCRThread
+from ocr_engine import create_ocr_thread
 
 # ------------------ Hlasový výstup ------------------
 speaker = Auto()
@@ -91,6 +91,13 @@ class ScanApp(QWidget):
 
         layout.addWidget(QLabel("Jazyk OCR:"))
         layout.addWidget(self.lang_combo)
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(["Tesseract", "EasyOCR"])
+        self.engine_combo.setAccessibleName("OCR engine")
+        layout.addWidget(QLabel("OCR engine:"))
+        layout.addWidget(self.engine_combo)
+
         layout.addWidget(QLabel("Vyber profil NAPS2:"))
         self.device_combo.setAccessibleName("Vyber profil NAPS2")
         layout.addWidget(self.device_combo)
@@ -191,14 +198,28 @@ class ScanApp(QWidget):
 
     def run_ocr(self):
         speak("Zahajuji OCR.")
-        self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
-        self.progress_dialog.show()
-
         lang = self.lang_combo.currentText()
-        self.ocr_thread = OCRThread(self.scanned_images, lang)
+        engine = self.engine_combo.currentText()
+
+        self.ocr_thread = create_ocr_thread(engine, self.scanned_images, lang)
         self.ocr_thread.finished.connect(self.ocr_finished)
         self.ocr_thread.ocr_results.connect(self.set_ocr_results)
+
+        if engine == "EasyOCR":
+            self.progress_dialog = QProgressDialog("Načítám EasyOCR model...", "Zrušit", 0, 0, self)
+            self.ocr_thread.model_loading.connect(self._on_model_loaded)
+        else:
+            self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
+            self.ocr_thread.progress.connect(self.progress_dialog.setValue)
+
+        self.progress_dialog.show()
         self.ocr_thread.start()
+
+    def _on_model_loaded(self, value):
+        if value == 100:
+            self.progress_dialog.setMaximum(100)
+            self.progress_dialog.setLabelText("Probíhá OCR (EasyOCR)...")
+            self.ocr_thread.progress.connect(self.progress_dialog.setValue)
 
     def set_ocr_results(self, results):
         self.last_ocr_results = results
