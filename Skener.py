@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
-from PyQt6.QtCore import Qt, QEventLoop, QSettings
+from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer
 from PIL import Image, ImageQt, ImageFilter, ImageOps
 from docx import Document
 import fitz
@@ -35,10 +35,11 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 # ------------------ Náhled dialog ------------------
 class PreviewDialog(QDialog):
-    def __init__(self, pil_img: Image.Image) -> None:
+    def __init__(self, pil_img: Image.Image, page_num: int = 1) -> None:
         super().__init__()
         self.setWindowTitle("Náhled skenu")
         self.image = pil_img
+        self.page_num = page_num
 
         self.label = QLabel()
         self.update_image()
@@ -60,6 +61,10 @@ class PreviewDialog(QDialog):
         layout.addLayout(btn_layout)
         self.setLayout(layout)
 
+        QTimer.singleShot(300, lambda: speak(
+            f"Náhled stránky {page_num}. Otočte obrázek nebo potvrďte náhled."
+        ))
+
     def update_image(self) -> None:
         qimg = ImageQt.ImageQt(self.image)
         pix = QPixmap.fromImage(qimg).scaled(
@@ -70,6 +75,7 @@ class PreviewDialog(QDialog):
     def rotate_image(self) -> None:
         self.image = self.image.rotate(-90, expand=True)
         self.update_image()
+        speak("Obrázek otočen.")
 
 # ------------------ Dialog pro editaci OCR výsledku ------------------
 class OcrPreviewDialog(QDialog):
@@ -105,6 +111,10 @@ class OcrPreviewDialog(QDialog):
 
     def read_text(self) -> None:
         speak(self.text_edit.toPlainText())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.text_edit.setFocus()
 
     def get_text(self) -> str:
         return self.text_edit.toPlainText()
@@ -286,6 +296,7 @@ class ScanApp(QWidget):
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.read_last_text)
         QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self.export_images)
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.close)
+        QShortcut(QKeySequence("Delete"), self).activated.connect(self.delete_page)
 
     # ---------- Settings persistence ----------
     def _load_settings(self) -> None:
@@ -356,11 +367,14 @@ class ScanApp(QWidget):
             if self.batch_cb.isChecked():
                 continue
 
+            speak("Další stránka?")
             msg = QMessageBox(self)
-            msg.setWindowTitle("Další")
+            msg.setWindowTitle("Další stránka")
             msg.setText("Další stránka?")
             btn_yes = msg.addButton("Ano", QMessageBox.ButtonRole.YesRole)
+            btn_yes.setAccessibleName("Ano, skenovat další stránku")
             btn_no = msg.addButton("Ne", QMessageBox.ButtonRole.NoRole)
+            btn_no.setAccessibleName("Ne, ukončit skenování")
             msg.exec()
             if msg.clickedButton() != btn_yes:
                 break
@@ -368,8 +382,10 @@ class ScanApp(QWidget):
         if self.scanned_images:
             self.btn_ocr.setEnabled(True)
             self.page_list.addItems([f"Stránka {i+1}" for i in range(len(self.scanned_images))])
+            self.page_list.setFocus()
             speak(f"Skenování dokončeno. {len(self.scanned_images)} stránek.")
         else:
+            self.btn_scan.setFocus()
             speak("Skenování dokončeno, žádné stránky.")
 
     def scan_all_pages(self) -> None:
@@ -414,6 +430,7 @@ class ScanApp(QWidget):
 
     def _cancel_scan(self) -> None:
         self._scan_cancelled = True
+        speak("Skenování zrušeno.")
 
     def _scan_finished(self, img: Image.Image) -> None:
         self.progress_dialog.cancel()
@@ -421,7 +438,7 @@ class ScanApp(QWidget):
             self.last_scanned_image = None
             return
 
-        preview = PreviewDialog(img)
+        preview = PreviewDialog(img, len(self.scanned_images) + 1)
         if preview.exec():
             processed = preview.image
             if self.preprocess_cb.isChecked():
@@ -433,6 +450,7 @@ class ScanApp(QWidget):
 
     def _scan_error(self, msg: str) -> None:
         self.progress_dialog.cancel()
+        speak(f"Chyba skenování: {msg}")
         QMessageBox.critical(self, "Chyba skenování", msg)
         self.last_scanned_image = None
 
@@ -440,14 +458,23 @@ class ScanApp(QWidget):
     def delete_page(self) -> None:
         row = self.page_list.currentRow()
         if row < 0:
+            speak("Není vybrána žádná stránka k smazání.")
             return
         self.page_list.takeItem(row)
         del self.scanned_images[row]
         if self.last_ocr_results and row < len(self.last_ocr_results):
             del self.last_ocr_results[row]
-        if not self.scanned_images:
+        remaining = len(self.scanned_images)
+        if remaining == 0:
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
+            speak("Všechny stránky smazány.")
+        else:
+            speak(f"Stránka smazána. Zbývá {remaining} stránek.")
+            # Focus na stejnou pozici nebo poslední
+            next_row = min(row, remaining - 1)
+            self.page_list.setCurrentRow(next_row)
+            self.page_list.setFocus()
 
     def clear_pages(self) -> None:
         self.page_list.clear()
@@ -479,16 +506,23 @@ class ScanApp(QWidget):
             self.progress_dialog = QProgressDialog(
                 "Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self
             )
-            self.ocr_thread.progress.connect(self.progress_dialog.setValue)
 
+        self.ocr_thread.progress.connect(self._on_ocr_progress)
         self.progress_dialog.show()
         self.ocr_thread.start()
+
+    def _on_ocr_progress(self, value: int) -> None:
+        self.progress_dialog.setValue(value)
+        if value in (25, 50, 75):
+            speak(f"OCR z {value} procent hotovo")
+        elif value == 100:
+            speak("OCR dokončeno")
 
     def _on_model_loaded(self, value: int) -> None:
         if value == 100:
             self.progress_dialog.setMaximum(100)
             self.progress_dialog.setLabelText("Probíhá OCR (EasyOCR)...")
-            self.ocr_thread.progress.connect(self.progress_dialog.setValue)
+            speak("EasyOCR model načten, zahajuji rozpoznávání")
 
     def _set_ocr_results(self, results: list[list[OcrResult]]) -> None:
         self.last_ocr_results = results
@@ -496,6 +530,7 @@ class ScanApp(QWidget):
     def _ocr_finished(self, full_text: str) -> None:
         self.progress_dialog.cancel()
 
+        speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit, přečíst nebo uložit.")
         dialog = OcrPreviewDialog(full_text, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -510,6 +545,7 @@ class ScanApp(QWidget):
             "Text (*.txt);;PDF (*.pdf);;Word (*.docx)"
         )
         if not path:
+            self.btn_read.setFocus()
             return
 
         if path.lower().endswith(".pdf"):
@@ -521,6 +557,7 @@ class ScanApp(QWidget):
                 f.write(edited_text)
             QMessageBox.information(self, "Hotovo", "Text uložen.")
             speak("Soubor byl úspěšně uložen.")
+            self.btn_scan.setFocus()
 
     def read_last_text(self) -> None:
         text = getattr(self, '_last_text', None)
@@ -609,6 +646,8 @@ class ScanApp(QWidget):
 
         doc.save(path)
         QMessageBox.information(self, "Hotovo", "PDF uloženo.")
+        speak("PDF soubor uložen.")
+        self.btn_scan.setFocus()
 
     def _save_docx(self, text: str, path: str) -> None:
         doc = Document()
@@ -617,6 +656,8 @@ class ScanApp(QWidget):
             doc.add_page_break()
         doc.save(path)
         QMessageBox.information(self, "Hotovo", "DOCX uloženo.")
+        speak("Soubor uložen.")
+        self.btn_scan.setFocus()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
