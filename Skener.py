@@ -141,6 +141,7 @@ class ScanApp(QWidget):
         self.macro_manager = MacroManager()
         self.macro_manager.load_all()
         self._macro_runner = PipelineRunner(self)
+        self._macro_shortcuts: list[QShortcut] = []
 
         self._build_ui()
         self._setup_shortcuts()
@@ -340,12 +341,18 @@ class ScanApp(QWidget):
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.close)
         QShortcut(QKeySequence("Delete"), self).activated.connect(self.delete_page)
         QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self._open_macro_editor)
+        self._setup_macro_shortcuts()
+
+    def _setup_macro_shortcuts(self) -> None:
+        for sc in self._macro_shortcuts:
+            sc.setEnabled(False)
+            sc.deleteLater()
+        self._macro_shortcuts = []
         for macro in self.macro_manager.macros:
             if macro.shortcut:
-                ks = QKeySequence(macro.shortcut)
-                QShortcut(ks, self).activated.connect(
-                    lambda checked, m=macro: self._run_macro(m)
-                )
+                sc = QShortcut(QKeySequence(macro.shortcut), self)
+                sc.activated.connect(lambda checked=False, m=macro: self._run_macro(m))
+                self._macro_shortcuts.append(sc)
 
     # ---------- Settings persistence ----------
     def _load_settings(self) -> None:
@@ -774,6 +781,7 @@ class ScanApp(QWidget):
             self.macro_manager.rename(macro, new_name.strip())
             self.macro_manager.load_all()
             self._rebuild_macro_buttons()
+            self._setup_macro_shortcuts()
             self.speak(f"Makro přejmenováno na {new_name.strip()}")
 
     def _delete_macro(self, macro: Macro) -> None:
@@ -789,6 +797,7 @@ class ScanApp(QWidget):
         if msg.clickedButton() == btn_yes:
             self.macro_manager.delete(macro)
             self._rebuild_macro_buttons()
+            self._setup_macro_shortcuts()
             self.speak(f"Makro {macro.name} smazáno.")
 
 

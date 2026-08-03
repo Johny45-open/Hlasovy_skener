@@ -240,6 +240,7 @@ class MacroEditorDialog(QDialog):
         self.manager.save(macro)
         self.manager.load_all()
         self.app._rebuild_macro_buttons()
+        self.app._setup_macro_shortcuts()
         self.app.speak(f"Makro {macro.name} uloženo.")
         self.accept()
 
@@ -250,6 +251,7 @@ class MacroEditorDialog(QDialog):
         self.manager.save(macro)
         self.manager.load_all()
         self.app._rebuild_macro_buttons()
+        self.app._setup_macro_shortcuts()
         self.app.speak(f"Makro {macro.name} uloženo a spouštím.")
         self.accept()
         self.app._run_macro(macro)
