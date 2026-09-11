@@ -36,6 +36,14 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     img = ImageOps.autocontrast(img, cutoff=2)
     return img
 
+
+def alt_preprocess_image(img: Image.Image) -> Image.Image:
+    if img.mode != "L":
+        img = img.convert("L")
+    img = img.filter(ImageFilter.MedianFilter(3))
+    img = ImageOps.autocontrast(img, cutoff=1)
+    return img
+
 # ------------------ Náhled dialog ------------------
 class PreviewDialog(QDialog):
     def __init__(self, pil_img: Image.Image, page_num: int = 1) -> None:
@@ -132,6 +140,7 @@ class ScanApp(QWidget):
         self.settings = QSettings("HlasovySkener", "HlasovySkener")
         self.scanner = NAPS2Scanner()
         self.scanned_images: list[Image.Image] = []
+        self.raw_scanned_images: list[Image.Image] = []
         self.last_ocr_results: list[list[OcrResult]] = []
         self.last_scanned_image: Optional[bool] = None
         self._scan_cancelled = False
@@ -162,8 +171,7 @@ class ScanApp(QWidget):
         layout.setContentsMargins(15, 15, 15, 15)
 
         # -- Nastavení OCR --
-        ocr_group = QGroupBox("OCR")
-        ocr_group.setAccessibleName("Nastavení OCR")
+        ocr_group = QGroupBox("Nastavení OCR")
         ocr_layout = QVBoxLayout()
 
         lbl_lang = QLabel("Jazyk OCR:")
@@ -194,8 +202,7 @@ class ScanApp(QWidget):
         layout.addWidget(ocr_group)
 
         # -- Nastavení skeneru --
-        scan_group = QGroupBox("Skener")
-        scan_group.setAccessibleName("Nastavení skeneru")
+        scan_group = QGroupBox("Nastavení skeneru")
         scan_layout = QVBoxLayout()
 
         self.batch_cb = QCheckBox("Dávkový režim (automaticky všechny stránky)")
@@ -292,7 +299,6 @@ class ScanApp(QWidget):
 
         # -- Uživatelská makra --
         macro_group = QGroupBox("Uživatelská makra")
-        macro_group.setAccessibleName("Uživatelská makra")
         self._macro_container = QVBoxLayout()
         self._macro_buttons_layout = QVBoxLayout()
         self._macro_container.addLayout(self._macro_buttons_layout)
@@ -310,8 +316,28 @@ class ScanApp(QWidget):
         main_layout.addWidget(scroll)
         self.setLayout(main_layout)
         self.setStyleSheet("""
-            QComboBox, QSpinBox, QPushButton { padding: 6px; min-height: 1.5em; }
-            QGroupBox { margin-top: 1em; }
+            QPushButton, QComboBox, QSpinBox {
+                padding: 6px;
+                min-height: 1.5em;
+            }
+            QCheckBox {
+                padding: 6px;
+                min-height: 1.75em;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QGroupBox {
+                margin-top: 1.2em;
+                padding-top: 8px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 4px;
+            }
         """)
         self._rebuild_macro_buttons()
 
@@ -407,6 +433,7 @@ class ScanApp(QWidget):
     def scan_pages(self) -> None:
         speak("Zahajuji skenování.")
         self.scanned_images.clear()
+        self.raw_scanned_images.clear()
         self.page_list.clear()
         self.last_ocr_results.clear()
         self.btn_ocr.setEnabled(False)
@@ -496,9 +523,11 @@ class ScanApp(QWidget):
 
         preview = PreviewDialog(img, len(self.scanned_images) + 1)
         if preview.exec():
-            processed = preview.image
+            original = preview.image
+            processed = original
             if self.preprocess_cb.isChecked():
-                processed = preprocess_image(processed)
+                processed = preprocess_image(original)
+            self.raw_scanned_images.append(original)
             self.scanned_images.append(processed)
             self.last_scanned_image = processed
         else:
@@ -518,6 +547,7 @@ class ScanApp(QWidget):
             return
         self.page_list.takeItem(row)
         del self.scanned_images[row]
+        del self.raw_scanned_images[row]
         if self.last_ocr_results and row < len(self.last_ocr_results):
             del self.last_ocr_results[row]
         remaining = len(self.scanned_images)
@@ -535,6 +565,7 @@ class ScanApp(QWidget):
     def clear_pages(self) -> None:
         self.page_list.clear()
         self.scanned_images.clear()
+        self.raw_scanned_images.clear()
         self.last_ocr_results.clear()
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
@@ -545,14 +576,16 @@ class ScanApp(QWidget):
             QMessageBox.warning(self, "Chyba", "Nejdříve naskenujte stránky.")
             return
         speak("Zahajuji OCR.")
-        self._ocr_mode = "interactive"
-        self._start_ocr()
+        self._run_ocr_flow(interactive=True)
 
-    def _start_ocr(self, on_done: Optional[Callable[[], None]] = None) -> None:
-        lang = self.lang_combo.currentText()
-        engine = self.engine_combo.currentText()
-
-        self.ocr_thread = create_ocr_thread(engine, self.scanned_images, lang)
+    def _start_ocr(
+        self,
+        images: list[Image.Image],
+        lang: str,
+        engine: str,
+        on_done: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.ocr_thread = create_ocr_thread(engine, images, lang)
         self.ocr_thread.finished.connect(self._ocr_finished)
         self.ocr_thread.ocr_results.connect(self._set_ocr_results)
         if on_done:
@@ -572,11 +605,95 @@ class ScanApp(QWidget):
         self.progress_dialog.show()
         self.ocr_thread.start()
 
-    def _execute_ocr(self) -> None:
-        self._ocr_mode = "macro"
+    def _build_attempts(self) -> list[tuple[str, str, list[Image.Image]]]:
+        base_engine = self.engine_combo.currentText()
+        base_lang = self.lang_combo.currentText()
+        alt_engine = "EasyOCR" if base_engine == "Tesseract" else "Tesseract"
+
+        attempts: list[tuple[str, str, list[Image.Image]]] = [
+            (base_engine, base_lang, list(self.scanned_images)),
+            (alt_engine, base_lang, list(self.scanned_images)),
+        ]
+
+        for alt_lang in [
+            "eng (Angličtina)", "ces (Čeština)", "deu (Němčina)",
+            "fra (Francouzština)", "ita (Italština)", "pol (Polština)",
+        ]:
+            if alt_lang != base_lang:
+                attempts.append((base_engine, alt_lang, list(self.scanned_images)))
+                attempts.append((alt_engine, alt_lang, list(self.scanned_images)))
+
+        alt_images = [alt_preprocess_image(r) for r in self.raw_scanned_images]
+        if alt_images:
+            attempts.append((base_engine, base_lang, alt_images))
+            attempts.append((alt_engine, base_lang, alt_images))
+        return attempts
+
+    def _run_ocr_once(
+        self, lang: str, engine: str, images: list[Image.Image]
+    ) -> None:
         loop = QEventLoop()
-        self._start_ocr(on_done=loop.quit)
+        self._start_ocr(images, lang, engine, on_done=loop.quit)
         loop.exec()
+
+    def _has_ocr_text(self) -> bool:
+        for page in self.last_ocr_results:
+            for item in page:
+                if item.text and item.text.strip():
+                    return True
+        return False
+
+    def _run_ocr_flow(self, interactive: bool) -> None:
+        attempts = self._build_attempts()
+        total = len(attempts)
+        found = False
+        for i, (engine, lang, images) in enumerate(attempts, start=1):
+            if self._scan_cancelled:
+                break
+            speak(f"OCR pokus {i} z {total}.")
+            self._ocr_mode = "macro"
+            self._run_ocr_once(lang, engine, images)
+            if self._has_ocr_text():
+                found = True
+                break
+
+        if interactive:
+            if found:
+                self._ocr_mode = "interactive"
+                self._ocr_show_save_ui(self._last_text)
+            else:
+                action = self._ask_no_text_action()
+                if action == "rescan":
+                    speak("Znovu skenuji stránky a opakuji OCR.")
+                    self.scan_pages()
+                    if self.scanned_images:
+                        self._run_ocr_flow(interactive=True)
+                elif action == "continue":
+                    self._ocr_mode = "interactive"
+                    self._ocr_show_save_ui(self._last_text)
+
+    def _ask_no_text_action(self) -> str:
+        speak("Nebyl rozpoznán žádný text.")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Nerozpoznán žádný text")
+        msg.setText("Po všech pokusech nebyl rozpoznán žádný text.")
+        msg.setInformativeText("Co chcete udělat?")
+        btn_rescan = msg.addButton("Znovu naskenovat", QMessageBox.ButtonRole.YesRole)
+        btn_rescan.setAccessibleName("Znovu naskenovat stránky")
+        btn_cont = msg.addButton("Pokračovat k uložení", QMessageBox.ButtonRole.ActionRole)
+        btn_cont.setAccessibleName("Pokračovat k náhledu a uložení")
+        btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+        btn_cancel.setAccessibleName("Zrušit")
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_rescan:
+            return "rescan"
+        if clicked == btn_cont:
+            return "continue"
+        return "cancel"
+
+    def _execute_ocr(self) -> None:
+        self._run_ocr_flow(interactive=False)
 
     def _on_ocr_progress(self, value: int) -> None:
         self.progress_dialog.setValue(value)
