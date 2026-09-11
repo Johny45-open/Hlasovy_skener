@@ -6,7 +6,7 @@ from typing import Optional, Callable
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QComboBox, QSpinBox, QMessageBox, QFileDialog, QDialog, QListWidget,
+    QComboBox, QMessageBox, QFileDialog, QDialog, QListWidget,
     QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox,
     QInputDialog, QScrollArea
 )
@@ -228,13 +228,20 @@ class ScanApp(QWidget):
         scan_layout.addWidget(self.source_combo)
 
         lbl_dpi = QLabel("Rozlišení DPI:")
-        self.dpi_spin = QSpinBox()
-        self.dpi_spin.setRange(100, 1200)
-        self.dpi_spin.setValue(300)
-        self.dpi_spin.setAccessibleName("Rozlišení DPI")
-        lbl_dpi.setBuddy(self.dpi_spin)
+        self.dpi_combo = QComboBox()
+        self.dpi_combo.setAccessibleName("Rozlišení DPI")
+        self.dpi_combo.setEditable(False)
+        self.dpi_combo.addItem("200 DPI – rychlé skenování", 200)
+        self.dpi_combo.addItem("300 DPI – doporučeno pro OCR", 300)
+        self.dpi_combo.addItem("400 DPI – menší text", 400)
+        self.dpi_combo.addItem("600 DPI – velmi malý text", 600)
+        self.dpi_combo.addItem("1200 DPI – vysoká kvalita", 1200)
+        idx = self.dpi_combo.findData(300)
+        if idx >= 0:
+            self.dpi_combo.setCurrentIndex(idx)
+        lbl_dpi.setBuddy(self.dpi_combo)
         scan_layout.addWidget(lbl_dpi)
-        scan_layout.addWidget(self.dpi_spin)
+        scan_layout.addWidget(self.dpi_combo)
 
         lbl_color = QLabel("Režim:")
         self.color_combo = QComboBox()
@@ -323,7 +330,7 @@ class ScanApp(QWidget):
         main_layout.addWidget(scroll)
         self.setLayout(main_layout)
         self.setStyleSheet("""
-            QPushButton, QComboBox, QSpinBox {
+            QPushButton, QComboBox {
                 padding: 6px;
                 min-height: 1.5em;
             }
@@ -354,8 +361,8 @@ class ScanApp(QWidget):
         self.setTabOrder(self.preprocess_cb, self.batch_cb)
         self.setTabOrder(self.batch_cb, self.device_combo)
         self.setTabOrder(self.device_combo, self.source_combo)
-        self.setTabOrder(self.source_combo, self.dpi_spin)
-        self.setTabOrder(self.dpi_spin, self.color_combo)
+        self.setTabOrder(self.source_combo, self.dpi_combo)
+        self.setTabOrder(self.dpi_combo, self.color_combo)
         self.setTabOrder(self.color_combo, self.btn_scan)
         self.setTabOrder(self.btn_scan, self.btn_scan_next)
         self.setTabOrder(self.btn_scan_next, self.btn_scan_all)
@@ -398,7 +405,20 @@ class ScanApp(QWidget):
         if 0 <= engine_idx < self.engine_combo.count():
             self.engine_combo.setCurrentIndex(engine_idx)
         dpi_val = self.settings.value("scan/dpi", 300, type=int)
-        self.dpi_spin.setValue(dpi_val)
+        try:
+            dpi_val = int(dpi_val)
+        except (TypeError, ValueError):
+            dpi_val = 300
+        _allowed_dpi = {200, 300, 400, 600, 1200}
+        if dpi_val not in _allowed_dpi:
+            dpi_val = 300
+        idx = self.dpi_combo.findData(dpi_val)
+        if idx >= 0:
+            self.dpi_combo.setCurrentIndex(idx)
+        else:
+            idx_def = self.dpi_combo.findData(300)
+            if idx_def >= 0:
+                self.dpi_combo.setCurrentIndex(idx_def)
         source_idx = self.settings.value("scan/source_index", 0, type=int)
         if 0 <= source_idx < self.source_combo.count():
             self.source_combo.setCurrentIndex(source_idx)
@@ -411,7 +431,7 @@ class ScanApp(QWidget):
     def _save_settings(self) -> None:
         self.settings.setValue("ocr/lang_index", self.lang_combo.currentIndex())
         self.settings.setValue("ocr/engine_index", self.engine_combo.currentIndex())
-        self.settings.setValue("scan/dpi", self.dpi_spin.value())
+        self.settings.setValue("scan/dpi", self.dpi_combo.currentData())
         self.settings.setValue("scan/source_index", self.source_combo.currentIndex())
         self.settings.setValue("scan/color_index", self.color_combo.currentIndex())
         self.settings.setValue("scan/batch", self.batch_cb.isChecked())
@@ -573,7 +593,9 @@ class ScanApp(QWidget):
             return
 
         self.scanner.connect_device(device_name)
-        dpi = self.dpi_spin.value()
+        dpi = self.dpi_combo.currentData()
+        if dpi is None:
+            dpi = 300
         source = self.source_combo.currentText()
         color_text = self.color_combo.currentText()
         color_mode = (
@@ -947,7 +969,9 @@ class ScanApp(QWidget):
     # ---------- Save helpers ----------
     def _save_pdf(self, path: str) -> None:
         doc = fitz.open()
-        dpi = self.dpi_spin.value()
+        dpi = self.dpi_combo.currentData()
+        if dpi is None:
+            dpi = 300
         for i, img in enumerate(self.scanned_images):
             page = doc.new_page(
                 width=img.width / dpi * 72,
