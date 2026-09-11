@@ -12,6 +12,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer
+
+# QAccessible není v PyQt6 6.11+ exponován v Python API (ověřeno
+# ImportError: cannot import name 'QAccessible' from 'PyQt6.QtGui').
+# Qt interně posílá Focus event automaticky při setFocus(), takže
+# explicitní QAccessible.updateAccessibility() není nutné. Pokud by
+# budoucí verze PyQt6 QAccessible zpřístupnila, lze jej volat
+# podmíněně přes importlib – viz ScanApp._set_initial_focus().
 from PIL import Image, ImageQt, ImageFilter, ImageOps
 from docx import Document
 import fitz
@@ -156,6 +163,8 @@ class ScanApp(QWidget):
         self.macro_manager.load_all()
         self._macro_runner = PipelineRunner(self)
         self._macro_shortcuts: list[QShortcut] = []
+        # Flag pro jednorázové nastavení počátečního fokusu po zobrazení okna
+        self._initial_focus_done: bool = False
 
         self._build_ui()
         self._setup_shortcuts()
@@ -169,8 +178,13 @@ class ScanApp(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # QScrollArea nesmí krást počáteční fokus – je to kontejner
+        scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Viewport scroll area také nesmí být focusable (Qt default může být StrongFocus u některých stylů)
+        scroll.viewport().setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         container = QWidget()
+        container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         layout = QVBoxLayout(container)
         layout.setSpacing(12)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -385,6 +399,66 @@ class ScanApp(QWidget):
         self.setTabOrder(btn_clear_pages, self.btn_ocr)
         self.setTabOrder(self.btn_ocr, self.btn_read)
         self.setTabOrder(self.btn_read, btn_export_img)
+
+        # Uložit reference pro testování Tab order a pro focus handling
+        self._scroll_area = scroll
+        self._scroll_container = container
+        # QGroupBox nesmí být focusable – pojistka (default NoFocus, ale explicitně)
+        for _gb in (ocr_group, scan_group, macro_group):
+            _gb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Dekorativní QLabel také ne
+        for _lbl in (lbl_lang, lbl_engine, lbl_diac, lbl_device, lbl_source, lbl_dpi, lbl_color):
+            _lbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    # ---------- Počáteční fokus pro NVDA ----------
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._initial_focus_done:
+            # Odložit na konec event loopu – okno musí být viditelné a mapped.
+            # QTimer.singleShot(0, ...) je robustnější než přímé setFocus v __init__.
+            QTimer.singleShot(0, self._set_initial_focus)
+
+    def _set_initial_focus(self) -> None:
+        if self._initial_focus_done:
+            return
+        # Pokud okno ještě není aktivní (Windows activation delay), zkusit znovu
+        # – neagresivně, bez krádeže fokusu. Max 5 pokusů po 100 ms.
+        if not self.isActiveWindow():
+            # Zjistit, zda už byl pokus; uložit counter do atributu
+            tries = getattr(self, "_initial_focus_tries", 0)
+            if tries < 5:
+                self._initial_focus_tries = tries + 1
+                QTimer.singleShot(100, self._set_initial_focus)
+                return
+            # Po vyčerpání pokusů nastavit fokus i bez isActiveWindow –
+            # QWidget.setFocus() vyžaduje active window pro NVDA, ale
+            # fokus bude doručen jakmile se okno aktivuje uživatelem/WM.
+            # Nepoužívat QApplication.setActiveWindow() (deprecated) ani
+            # agresivní activateWindow() pokud uživatel mezitím přešel jinam.
+        # Nepoužívat zastaralé QApplication.setActiveWindow().
+        # activateWindow() pouze pokud je to bezpečné a okno je viditelné,
+        # ale nekrást fokus – proto jen pokud je okno viditelné a ještě neaktivní
+        # a uživatel zjevně aplikaci právě spustil (první show).
+        # V praxi stačí setFocus; Windows dá aktivaci automaticky při spuštění.
+        self.lang_combo.setFocus(Qt.FocusReason.OtherFocusReason)
+        # Qt interně pošle QAccessible::Focus event přes UIA bridge.
+        # Explicitní QAccessible.updateAccessibility() by bylo duplicitní
+        # a v PyQt6 6.11 není QAccessible v Python API vůbec exponován.
+        # Pokus o podmíněné poslání pouze pokud by bylo dostupné:
+        try:
+            import importlib
+            qacc = importlib.import_module("PyQt6.QtGui")
+            QAccessible = getattr(qacc, "QAccessible", None)
+            if QAccessible is not None and hasattr(QAccessible, "updateAccessibility"):
+                # isActive() guard – posílat jen když běží AT
+                is_active = getattr(QAccessible, "isActive", None)
+                if is_active is None or is_active():
+                    QAccessible.updateAccessibility(
+                        self.lang_combo, 0, QAccessible.Event.Focus
+                    )
+        except Exception:
+            pass
+        self._initial_focus_done = True
 
     def _setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.scan_pages)
