@@ -146,6 +146,8 @@ class ScanApp(QWidget):
         self._scan_cancelled = False
         self._ocr_mode = "interactive"
         self._last_text = ""
+        self._ocr_total_pages: int = 0
+        self._ocr_last_announced_page: int = 0
 
         self.macro_manager = MacroManager()
         self.macro_manager.load_all()
@@ -252,6 +254,11 @@ class ScanApp(QWidget):
         self.btn_scan.clicked.connect(self.scan_pages)
         scan_btn_layout.addWidget(self.btn_scan)
 
+        self.btn_scan_next = QPushButton("Skenovat další stránku (Ctrl+Shift+N)")
+        self.btn_scan_next.setAccessibleName("Skenovat další stránku – přidat ke stávajícímu dokumentu")
+        self.btn_scan_next.clicked.connect(self.scan_next_page)
+        scan_btn_layout.addWidget(self.btn_scan_next)
+
         self.btn_scan_all = QPushButton("Skenovat vše (Ctrl+Shift+S)")
         self.btn_scan_all.setAccessibleName("Skenovat všechny stránky dávkově")
         self.btn_scan_all.clicked.connect(self.scan_all_pages)
@@ -350,7 +357,8 @@ class ScanApp(QWidget):
         self.setTabOrder(self.source_combo, self.dpi_spin)
         self.setTabOrder(self.dpi_spin, self.color_combo)
         self.setTabOrder(self.color_combo, self.btn_scan)
-        self.setTabOrder(self.btn_scan, self.btn_scan_all)
+        self.setTabOrder(self.btn_scan, self.btn_scan_next)
+        self.setTabOrder(self.btn_scan_next, self.btn_scan_all)
         self.setTabOrder(self.btn_scan_all, self.page_list)
         self.setTabOrder(self.page_list, btn_delete_page)
         self.setTabOrder(btn_delete_page, btn_clear_pages)
@@ -360,6 +368,7 @@ class ScanApp(QWidget):
 
     def _setup_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.scan_pages)
+        QShortcut(QKeySequence("Ctrl+Shift+N"), self).activated.connect(self.scan_next_page)
         QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(self.scan_all_pages)
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.run_ocr)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.read_last_text)
@@ -431,13 +440,50 @@ class ScanApp(QWidget):
 
     # ---------- Scanning ----------
     def scan_pages(self) -> None:
+        # If pages already exist, never clear without confirmation.
+        if self.scanned_images:
+            count = len(self.scanned_images)
+            speak(f"Máte již {count} naskenovaných stránek. Potvrďte smazání nebo přidejte další stránku.")
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Nový dokument")
+            msg.setText(f"Máte již {count} naskenovaných stránek. Chcete začít nový dokument?")
+            msg.setInformativeText("Stávající stránky budou smazány. Můžete také přidat další stránku ke stávajícímu dokumentu.")
+            btn_new = msg.addButton("Ano, smazat a začít znovu", QMessageBox.ButtonRole.YesRole)
+            btn_new.setAccessibleName("Ano, smazat stávající stránky a začít nový dokument")
+            btn_append = msg.addButton("Přidat další stránku", QMessageBox.ButtonRole.ActionRole)
+            btn_append.setAccessibleName("Přidat další stránku ke stávajícímu dokumentu")
+            btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+            btn_cancel.setAccessibleName("Zrušit, zachovat stránky")
+            msg.setDefaultButton(btn_cancel)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked == btn_append:
+                self.scan_next_page()
+                return
+            if clicked != btn_new:
+                speak("Skenování zrušeno, stránky zachovány.")
+                self.page_list.setFocus()
+                return
+            # User confirmed new document – clear everything
+            self.scanned_images.clear()
+            self.raw_scanned_images.clear()
+            self.page_list.clear()
+            self.last_ocr_results.clear()
+            self._last_text = ""
+            self.btn_ocr.setEnabled(False)
+            self.btn_read.setEnabled(False)
+        else:
+            # No pages – ensure clean state (in case of residual OCR results)
+            self.last_ocr_results.clear()
+            self._last_text = ""
+
         speak("Zahajuji skenování.")
-        self.scanned_images.clear()
-        self.raw_scanned_images.clear()
-        self.page_list.clear()
-        self.last_ocr_results.clear()
+        # Keep button states disabled until at least one page succeeds
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
+
+        # Remember count before scanning for correct voice after
+        start_count = len(self.scanned_images)
 
         while True:
             self.last_scanned_image = None
@@ -464,12 +510,55 @@ class ScanApp(QWidget):
 
         if self.scanned_images:
             self.btn_ocr.setEnabled(True)
+            # In new-document mode we cleared page_list, so repopulate.
+            # If start_count was 0 we are in new mode; otherwise we already cleared.
+            self.page_list.clear()
             self.page_list.addItems([f"Stránka {i+1}" for i in range(len(self.scanned_images))])
             self.page_list.setFocus()
             speak(f"Skenování dokončeno. {len(self.scanned_images)} stránek.")
         else:
             self.btn_scan.setFocus()
             speak("Skenování dokončeno, žádné stránky.")
+
+    def scan_next_page(self) -> None:
+        speak("Přidávám další stránku ke stávajícímu dokumentu.")
+        count_before = len(self.scanned_images)
+        self.last_scanned_image = None
+        self._scan_cancelled = False
+        self._do_scan_single()
+
+        if self._scan_cancelled or self.last_scanned_image is None:
+            speak("Skenování další stránky zrušeno.")
+            if self.scanned_images:
+                self.page_list.setFocus()
+            else:
+                self.btn_scan.setFocus()
+            return
+
+        # _scan_finished already appended images; now update page_list incrementally
+        new_num = len(self.scanned_images)
+        # Guard against double-add if scan_pages bulk path was used – but scan_next_page
+        # never clears, so page_list should have count_before items
+        if self.page_list.count() < new_num:
+            self.page_list.addItem(f"Stránka {new_num}")
+        else:
+            # Fallback: rebuild to stay consistent
+            self.page_list.clear()
+            self.page_list.addItems([f"Stránka {i+1}" for i in range(new_num)])
+
+        self.btn_ocr.setEnabled(True)
+        self.page_list.setCurrentRow(new_num - 1)
+        self.page_list.setFocus()
+        total = len(self.scanned_images)
+        # Keep existing OCR results for pages 1..count_before; new page is not OCRed yet
+        if self.last_ocr_results and len(self.last_ocr_results) < total:
+            speak(f"Stránka {new_num} přidána. Celkem {total} stránek. OCR nové stránky zatím nebylo provedeno.")
+        else:
+            speak(f"Stránka {new_num} přidána. Celkem {total} stránek.")
+
+    def _renumber_pages(self) -> None:
+        for i in range(self.page_list.count()):
+            self.page_list.item(i).setText(f"Stránka {i+1}")
 
     def scan_all_pages(self) -> None:
         old_batch = self.batch_cb.isChecked()
@@ -545,16 +634,38 @@ class ScanApp(QWidget):
         if row < 0:
             speak("Není vybrána žádná stránka k smazání.")
             return
+        page_num = row + 1
+        speak(f"Potvrdit smazání stránky {page_num}.")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Potvrdit smazání stránky")
+        msg.setText(f"Opravdu chcete smazat stránku {page_num}?")
+        msg.setInformativeText("Tuto akci nelze vrátit.")
+        btn_yes = msg.addButton("Ano", QMessageBox.ButtonRole.YesRole)
+        btn_yes.setAccessibleName(f"Ano, smazat stránku {page_num}")
+        btn_no = msg.addButton("Ne", QMessageBox.ButtonRole.NoRole)
+        btn_no.setAccessibleName("Ne, ponechat stránku")
+        msg.setDefaultButton(btn_no)
+        msg.exec()
+        if msg.clickedButton() != btn_yes:
+            speak("Smazání zrušeno.")
+            self.page_list.setFocus()
+            self.page_list.setCurrentRow(row)
+            return
+
         self.page_list.takeItem(row)
         del self.scanned_images[row]
         del self.raw_scanned_images[row]
         if self.last_ocr_results and row < len(self.last_ocr_results):
             del self.last_ocr_results[row]
+        # Renumber remaining items to keep Stránka 1..N consistent
+        self._renumber_pages()
         remaining = len(self.scanned_images)
         if remaining == 0:
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
+            self._last_text = ""
             speak("Všechny stránky smazány.")
+            self.btn_scan.setFocus()
         else:
             speak(f"Stránka smazána. Zbývá {remaining} stránek.")
             # Focus na stejnou pozici nebo poslední
@@ -563,19 +674,44 @@ class ScanApp(QWidget):
             self.page_list.setFocus()
 
     def clear_pages(self) -> None:
+        count = len(self.scanned_images)
+        if count == 0:
+            speak("Žádné stránky ke smazání.")
+            return
+        speak(f"Potvrdit smazání všech {count} stránek.")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Potvrdit smazání všech stránek")
+        msg.setText(f"Opravdu chcete smazat všech {count} naskenovaných stránek?")
+        msg.setInformativeText("Budou odstraněny všechny naskenované stránky a jejich OCR výsledky. Tuto akci nelze vrátit.")
+        btn_yes = msg.addButton("Ano", QMessageBox.ButtonRole.YesRole)
+        btn_yes.setAccessibleName("Ano, smazat všechny stránky")
+        btn_no = msg.addButton("Ne", QMessageBox.ButtonRole.NoRole)
+        btn_no.setAccessibleName("Ne, ponechat stránky")
+        msg.setDefaultButton(btn_no)
+        msg.exec()
+        if msg.clickedButton() != btn_yes:
+            speak("Smazání zrušeno.")
+            self.page_list.setFocus()
+            return
         self.page_list.clear()
         self.scanned_images.clear()
         self.raw_scanned_images.clear()
         self.last_ocr_results.clear()
+        self._last_text = ""
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
+        speak(f"Všech {count} stránek smazáno.")
+        self.btn_scan.setFocus()
 
     # ---------- OCR ----------
     def run_ocr(self) -> None:
         if not self.scanned_images:
             QMessageBox.warning(self, "Chyba", "Nejdříve naskenujte stránky.")
             return
-        speak("Zahajuji OCR.")
+        total = len(self.scanned_images)
+        self._ocr_total_pages = total
+        self._ocr_last_announced_page = 0
+        speak(f"Zahajuji OCR {total} stránek.")
         self._run_ocr_flow(interactive=True)
 
     def _start_ocr(
@@ -693,13 +829,23 @@ class ScanApp(QWidget):
         return "cancel"
 
     def _execute_ocr(self) -> None:
+        # Ensure per-page announcements also work for macro/non-interactive path
+        self._ocr_total_pages = len(self.scanned_images)
+        self._ocr_last_announced_page = 0
         self._run_ocr_flow(interactive=False)
 
     def _on_ocr_progress(self, value: int) -> None:
         self.progress_dialog.setValue(value)
-        if value in (25, 50, 75):
-            speak(f"OCR z {value} procent hotovo")
-        elif value == 100:
+        # Per-page voice feedback – throttled to once per page
+        total = getattr(self, "_ocr_total_pages", len(self.scanned_images)) or 1
+        # Derive current page from progress percent
+        current_page = int(round(value / 100 * total)) if total else 0
+        if current_page > 0 and current_page != getattr(self, "_ocr_last_announced_page", 0):
+            # Avoid double-announce at 100 which is handled separately
+            if value != 100:
+                speak(f"OCR stránky {current_page} z {total}.")
+            self._ocr_last_announced_page = current_page
+        if value == 100:
             speak("OCR dokončeno")
 
     def _on_model_loaded(self, value: int) -> None:
@@ -715,6 +861,9 @@ class ScanApp(QWidget):
         self.progress_dialog.cancel()
         self._last_text = full_text
         self.btn_read.setEnabled(True)
+        total = getattr(self, "_ocr_total_pages", len(self.scanned_images))
+        if total:
+            speak(f"OCR dokončeno pro {total} stránek.")
         if self._ocr_mode == "interactive":
             self._ocr_show_save_ui(full_text)
 
