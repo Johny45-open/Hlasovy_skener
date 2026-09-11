@@ -14,6 +14,22 @@ from PyQt6.QtCore import QThread, pyqtSignal
 class OcrResult:
     text: str
     bbox: Optional[list[list[float]]] = None
+    original_text: Optional[str] = None
+    processed_text: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Zachovej původní text pro pozdější diakritizaci / exporty
+        if self.original_text is None:
+            self.original_text = self.text
+        if self.processed_text is None:
+            self.processed_text = self.text
+
+    @property
+    def display_text(self) -> str:
+        """Text pro zobrazení/export – processed pokud existuje."""
+        if self.processed_text is not None:
+            return self.processed_text
+        return self.text
 
 
 LANG_MAP_EASYOCR = {
@@ -30,11 +46,14 @@ class TesseractThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
     ocr_results = pyqtSignal(list)
+    diacritics_failed = pyqtSignal(str)
 
-    def __init__(self, images: list[Image.Image], lang_code: str) -> None:
+    def __init__(self, images: list[Image.Image], lang_code: str, diacritics_enabled: bool = False, raw_lang_code: str = "") -> None:
         super().__init__()
         self.images = images
         self.lang_code = _extract_lang_code(lang_code)
+        self.raw_lang_code = raw_lang_code or lang_code
+        self.diacritics_enabled = diacritics_enabled
 
     def run(self) -> None:
         full_text = ""
@@ -64,6 +83,31 @@ class TesseractThread(QThread):
                     page_results.append(OcrResult(text=data["text"][j], bbox=bbox))
 
             page_text = pytesseract.image_to_string(img, lang=self.lang_code)
+
+            # --- Volitelná diakritizace (mimo GUI vlákno, uvnitř workeru) ---
+            try:
+                from diacritics import should_diacritize, get_diacritizer
+                if should_diacritize(self.raw_lang_code, self.diacritics_enabled):
+                    diac = get_diacritizer()
+                    corrected_page_text = diac.diacritize(page_text)
+                    # per-word bbox zachován, text opraven
+                    new_page_results: list[OcrResult] = []
+                    for r in page_results:
+                        orig = r.text
+                        corr = diac.diacritize(orig)
+                        new_page_results.append(OcrResult(text=corr, bbox=r.bbox, original_text=orig, processed_text=corr))
+                    page_results = new_page_results
+                    page_text = corrected_page_text
+                else:
+                    # vyplň original/processed identicky
+                    page_results = [OcrResult(text=r.text, bbox=r.bbox, original_text=r.text, processed_text=r.text) for r in page_results]
+            except Exception as e:
+                try:
+                    self.diacritics_failed.emit(str(e))
+                except Exception:
+                    pass
+                page_results = [OcrResult(text=r.text, bbox=r.bbox, original_text=r.text, processed_text=r.text) for r in page_results]
+
             full_text += f"--- Stránka {i + 1} ---\n{page_text}\n\n"
             results_list.append(page_results)
 
@@ -82,12 +126,15 @@ class EasyOCRThread(QThread):
     finished = pyqtSignal(str)
     ocr_results = pyqtSignal(list)
     model_loading = pyqtSignal(int)
+    diacritics_failed = pyqtSignal(str)
 
-    def __init__(self, images: list[Image.Image], lang_code: str) -> None:
+    def __init__(self, images: list[Image.Image], lang_code: str, diacritics_enabled: bool = False, raw_lang_code: str = "") -> None:
         super().__init__()
         self.images = images
         pyt_code = _extract_lang_code(lang_code)
         self.lang_code = LANG_MAP_EASYOCR.get(pyt_code, pyt_code[:2])
+        self.raw_lang_code = raw_lang_code or lang_code
+        self.diacritics_enabled = diacritics_enabled
 
     def run(self) -> None:
         self._ensure_reader()
@@ -132,6 +179,28 @@ class EasyOCRThread(QThread):
 
                 page_text += result[1] if len(result) == 3 else text + "\n"
 
+            # --- Volitelná diakritizace (mimo GUI vlákno) ---
+            try:
+                from diacritics import should_diacritize, get_diacritizer
+                if should_diacritize(self.raw_lang_code, self.diacritics_enabled):
+                    diac = get_diacritizer()
+                    corrected_page_text = diac.diacritize(page_text)
+                    new_page_results: list[OcrResult] = []
+                    for r in page_results:
+                        orig = r.text
+                        corr = diac.diacritize(orig)
+                        new_page_results.append(OcrResult(text=corr, bbox=r.bbox, original_text=orig, processed_text=corr))
+                    page_results = new_page_results
+                    page_text = corrected_page_text
+                else:
+                    page_results = [OcrResult(text=r.text, bbox=r.bbox, original_text=r.text, processed_text=r.text) for r in page_results]
+            except Exception as e:
+                try:
+                    self.diacritics_failed.emit(str(e))
+                except Exception:
+                    pass
+                page_results = [OcrResult(text=r.text, bbox=r.bbox, original_text=r.text, processed_text=r.text) for r in page_results]
+
             full_text += f"--- Stránka {i + 1} ---\n{page_text}\n\n"
             results_list.append(page_results)
 
@@ -158,8 +227,8 @@ class EasyOCRThread(QThread):
 
 
 def create_ocr_thread(
-    engine: str, images: list[Image.Image], lang_code: str
+    engine: str, images: list[Image.Image], lang_code: str, diacritics_enabled: bool = False
 ) -> TesseractThread | EasyOCRThread:
     if engine == "EasyOCR":
-        return EasyOCRThread(images, lang_code)
-    return TesseractThread(images, lang_code)
+        return EasyOCRThread(images, lang_code, diacritics_enabled=diacritics_enabled, raw_lang_code=lang_code)
+    return TesseractThread(images, lang_code, diacritics_enabled=diacritics_enabled, raw_lang_code=lang_code)

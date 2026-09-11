@@ -146,6 +146,9 @@ class ScanApp(QWidget):
         self._scan_cancelled = False
         self._ocr_mode = "interactive"
         self._last_text = ""
+        self._last_original_text = ""
+        self._diacritics_failed = False
+        self._diacritics_enabled_cache = False
         self._ocr_total_pages: int = 0
         self._ocr_last_announced_page: int = 0
 
@@ -199,6 +202,15 @@ class ScanApp(QWidget):
         self.preprocess_cb.setAccessibleName("Předzpracování obrazu")
         self.preprocess_cb.setChecked(True)
         ocr_layout.addWidget(self.preprocess_cb)
+
+        lbl_diac = QLabel("Oprava české diakritiky:")
+        self.diacritics_cb = QCheckBox("Oprava české diakritiky")
+        self.diacritics_cb.setAccessibleName("Oprava české diakritiky")
+        self.diacritics_cb.setChecked(False)
+        self.diacritics_cb.toggled.connect(self._on_diacritics_toggled)
+        lbl_diac.setBuddy(self.diacritics_cb)
+        ocr_layout.addWidget(lbl_diac)
+        ocr_layout.addWidget(self.diacritics_cb)
 
         ocr_group.setLayout(ocr_layout)
         layout.addWidget(ocr_group)
@@ -358,7 +370,8 @@ class ScanApp(QWidget):
         # -- Tab order --
         self.setTabOrder(self.lang_combo, self.engine_combo)
         self.setTabOrder(self.engine_combo, self.preprocess_cb)
-        self.setTabOrder(self.preprocess_cb, self.batch_cb)
+        self.setTabOrder(self.preprocess_cb, self.diacritics_cb)
+        self.setTabOrder(self.diacritics_cb, self.batch_cb)
         self.setTabOrder(self.batch_cb, self.device_combo)
         self.setTabOrder(self.device_combo, self.source_combo)
         self.setTabOrder(self.source_combo, self.dpi_combo)
@@ -427,6 +440,15 @@ class ScanApp(QWidget):
             self.color_combo.setCurrentIndex(color_idx)
         self.batch_cb.setChecked(self.settings.value("scan/batch", False, type=bool))
         self.preprocess_cb.setChecked(self.settings.value("ocr/preprocess", True, type=bool))
+        self.diacritics_cb.setChecked(self.settings.value("ocr/diacritics", False, type=bool))
+
+    def _on_diacritics_toggled(self, checked: bool) -> None:
+        # Hlasová odezva při přepnutí
+        if checked:
+            speak("Oprava české diakritiky zapnuta.")
+        else:
+            speak("Oprava české diakritiky vypnuta.")
+        self._save_settings()
 
     def _save_settings(self) -> None:
         self.settings.setValue("ocr/lang_index", self.lang_combo.currentIndex())
@@ -436,6 +458,7 @@ class ScanApp(QWidget):
         self.settings.setValue("scan/color_index", self.color_combo.currentIndex())
         self.settings.setValue("scan/batch", self.batch_cb.isChecked())
         self.settings.setValue("ocr/preprocess", self.preprocess_cb.isChecked())
+        self.settings.setValue("ocr/diacritics", self.diacritics_cb.isChecked())
 
     def closeEvent(self, event) -> None:
         self._save_settings()
@@ -490,12 +513,16 @@ class ScanApp(QWidget):
             self.page_list.clear()
             self.last_ocr_results.clear()
             self._last_text = ""
+            self._last_original_text = ""
+            self._diacritics_failed = False
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
         else:
             # No pages – ensure clean state (in case of residual OCR results)
             self.last_ocr_results.clear()
             self._last_text = ""
+            self._last_original_text = ""
+            self._diacritics_failed = False
 
         speak("Zahajuji skenování.")
         # Keep button states disabled until at least one page succeeds
@@ -686,6 +713,8 @@ class ScanApp(QWidget):
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
             self._last_text = ""
+            self._last_original_text = ""
+            self._diacritics_failed = False
             speak("Všechny stránky smazány.")
             self.btn_scan.setFocus()
         else:
@@ -720,17 +749,125 @@ class ScanApp(QWidget):
         self.raw_scanned_images.clear()
         self.last_ocr_results.clear()
         self._last_text = ""
+        self._last_original_text = ""
+        self._diacritics_failed = False
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
         speak(f"Všech {count} stránek smazáno.")
         self.btn_scan.setFocus()
 
     # ---------- OCR ----------
+    def _run_ocr_incremental(self, start_idx: int) -> None:
+        """OCR pouze pro nově přidané stránky start_idx..end, zachová 1..start_idx-1."""
+        new_images = self.scanned_images[start_idx:]
+        if not new_images:
+            return
+        total_new = len(new_images)
+        total_all = len(self.scanned_images)
+        self._ocr_total_pages = total_all
+        self._ocr_last_announced_page = start_idx  # aby progress hlásil od start_idx+1
+        speak(f"Zahajuji OCR {total_new} nových stránek (celkem {total_all}).")
+        base_engine = self.engine_combo.currentText()
+        base_lang = self.lang_combo.currentText()
+        # Jednorázový pokus pro nové stránky – stačí base pokus, fallback ponechán pro full flow
+        # Zde použijeme stejný mechanismus jako _run_ocr_once ale s merge
+        old_results = list(self.last_ocr_results)
+        old_text = self._last_text
+
+        # Dočasné sloty pro merge
+        new_results_holder: list[list[OcrResult]] = []
+        new_text_holder: list[str] = []
+
+        loop = QEventLoop()
+
+        def on_results(r):
+            new_results_holder.clear()
+            new_results_holder.extend(r)
+
+        def on_finished(txt: str):
+            new_text_holder.append(txt)
+            loop.quit()
+
+        # Vytvoř thread pro nové stránky
+        diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
+        self._diacritics_failed = False
+        self._diacritics_enabled_cache = diac_enabled
+        self.ocr_thread = create_ocr_thread(base_engine, new_images, base_lang, diacritics_enabled=diac_enabled)
+        self.ocr_thread.ocr_results.connect(on_results)
+        self.ocr_thread.finished.connect(on_finished)
+        if hasattr(self.ocr_thread, "diacritics_failed"):
+            self.ocr_thread.diacritics_failed.connect(self._on_diacritics_failed)
+        if base_engine == "EasyOCR":
+            self.progress_dialog = QProgressDialog("Načítám EasyOCR model...", "Zrušit", 0, 0, self)
+            self.ocr_thread.model_loading.connect(self._on_model_loaded)
+        else:
+            self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
+        self.ocr_thread.progress.connect(self._on_ocr_progress)
+        self.progress_dialog.show()
+        self.ocr_thread.start()
+        loop.exec()
+        self.progress_dialog.cancel()
+
+        if not new_results_holder:
+            speak("OCR nových stránek neprodukovalo žádné výsledky.")
+            return
+        # Oprav číslování stránek v novém textu (thread čísluje od 1)
+        # Sestav korektní full_text pro nové stránky s posunutým číslováním
+        corrected_new_text = ""
+        for i, page_results in enumerate(new_results_holder):
+            page_num = start_idx + i + 1
+            # Extrahuj text stránky z new_text_holder[0] – jednodušší rekonstruovat z page_results
+            # ale zachovej původní diakritizovaný text včetně odřádkování – použij display_text
+            page_text_parts = [r.display_text for r in page_results]
+            # Pokud page_results obsahuje věty s newline, spoj mezery
+            page_text = "\n".join(page_text_parts)
+            # Pokud původní new_text_holder obsahuje více, použij ho přímo s přečíslováním
+            # Pro jednoduchost použij page_text z results
+            corrected_new_text += f"--- Stránka {page_num} ---\n{page_text}\n\n"
+
+        # Merge
+        self.last_ocr_results = old_results + new_results_holder
+        # Pokud byl původní full_text s headery, připoj nové; jinak použij corrected
+        # Pro zachování přesnosti použij starý text + corrected_new_text
+        if old_text and old_text.strip():
+            self._last_text = old_text.rstrip() + "\n\n" + corrected_new_text
+        else:
+            self._last_text = corrected_new_text
+        # Rekonstrukce originálu
+        try:
+            orig_parts = []
+            for idx, page in enumerate(self.last_ocr_results):
+                if page:
+                    texts = [r.original_text if r.original_text is not None else r.text for r in page]
+                    orig_parts.append(f"--- Stránka {idx + 1} ---\n" + "\n".join(texts) + "\n\n")
+            self._last_original_text = "".join(orig_parts) if any(orig_parts) else self._last_text
+        except Exception:
+            self._last_original_text = self._last_text
+        self.btn_read.setEnabled(True)
+        # Hlasová odezva
+        from diacritics import should_diacritize
+        lang = self.lang_combo.currentText() if hasattr(self, "lang_combo") else ""
+        diac_active = should_diacritize(lang, self._diacritics_enabled_cache)
+        if self._diacritics_failed and diac_active:
+            speak("OCR dokončeno. Oprava české diakritiky se nepodařila. Byl zachován původní text.")
+        elif diac_active:
+            speak("OCR dokončeno a česká diakritika opravena.")
+        else:
+            speak(f"OCR dokončeno pro {total_all} stránek.")
+
+        self._ocr_mode = "interactive"
+        self._ocr_show_save_ui(self._last_text)
+
     def run_ocr(self) -> None:
         if not self.scanned_images:
             QMessageBox.warning(self, "Chyba", "Nejdříve naskenujte stránky.")
             return
         total = len(self.scanned_images)
+        # Inkrementální OCR: pokud již máme OCR pro část stránek, zpracuj pouze nové
+        if self.last_ocr_results and 0 < len(self.last_ocr_results) < total:
+            # Zachovej pořadí 1..N, přidej pouze chybějící N+1..total
+            self._run_ocr_incremental(len(self.last_ocr_results))
+            return
         self._ocr_total_pages = total
         self._ocr_last_announced_page = 0
         speak(f"Zahajuji OCR {total} stránek.")
@@ -743,9 +880,14 @@ class ScanApp(QWidget):
         engine: str,
         on_done: Optional[Callable[[], None]] = None,
     ) -> None:
-        self.ocr_thread = create_ocr_thread(engine, images, lang)
+        diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
+        self._diacritics_failed = False
+        self._diacritics_enabled_cache = diac_enabled
+        self.ocr_thread = create_ocr_thread(engine, images, lang, diacritics_enabled=diac_enabled)
         self.ocr_thread.finished.connect(self._ocr_finished)
         self.ocr_thread.ocr_results.connect(self._set_ocr_results)
+        if hasattr(self.ocr_thread, "diacritics_failed"):
+            self.ocr_thread.diacritics_failed.connect(self._on_diacritics_failed)
         if on_done:
             self.ocr_thread.finished.connect(on_done)
 
@@ -879,13 +1021,40 @@ class ScanApp(QWidget):
     def _set_ocr_results(self, results: list[list[OcrResult]]) -> None:
         self.last_ocr_results = results
 
+    def _on_diacritics_failed(self, msg: str) -> None:
+        self._diacritics_failed = True
+
     def _ocr_finished(self, full_text: str) -> None:
         self.progress_dialog.cancel()
         self._last_text = full_text
+        # Rekonstrukce originálu z OcrResult.original_text pro zachování původního výsledku
+        try:
+            orig_parts = []
+            for idx, page in enumerate(self.last_ocr_results):
+                # pokud máme bbox výsledky, poskládej originál, jinak použij full_text
+                if page:
+                    texts = [r.original_text if r.original_text is not None else r.text for r in page]
+                    orig_parts.append(f"--- Stránka {idx + 1} ---\n" + "\n".join(texts) + "\n\n")
+                else:
+                    orig_parts.append("")
+            self._last_original_text = "".join(orig_parts) if any(orig_parts) else full_text
+        except Exception:
+            self._last_original_text = full_text
         self.btn_read.setEnabled(True)
         total = getattr(self, "_ocr_total_pages", len(self.scanned_images))
-        if total:
-            speak(f"OCR dokončeno pro {total} stránek.")
+        # Hlasová odezva dle diakritiky
+        from diacritics import should_diacritize
+        lang = self.lang_combo.currentText() if hasattr(self, "lang_combo") else ""
+        diac_active = should_diacritize(lang, self._diacritics_enabled_cache)
+        if self._diacritics_failed and diac_active:
+            speak("OCR dokončeno. Oprava české diakritiky se nepodařila. Byl zachován původní text.")
+        elif diac_active:
+            speak("OCR dokončeno a česká diakritika opravena.")
+            if total:
+                speak(f"OCR dokončeno pro {total} stránek.")
+        else:
+            if total:
+                speak(f"OCR dokončeno pro {total} stránek.")
         if self._ocr_mode == "interactive":
             self._ocr_show_save_ui(full_text)
 
@@ -918,8 +1087,12 @@ class ScanApp(QWidget):
             self.btn_scan.setFocus()
 
     def read_last_text(self) -> None:
+        # Při zapnuté opravě čte processed_text (už v _last_text), jinak originál
+        text_to_read = self._last_text
         if self._last_text:
-            speak(self._last_text)
+            speak(text_to_read)
+        else:
+            speak("Není žádný text k přečtení.")
 
     # ---------- Export ----------
     def export_images(self) -> None:
@@ -995,7 +1168,10 @@ class ScanApp(QWidget):
                                 x0 / dpi * 72, y0 / dpi * 72,
                                 x1 / dpi * 72, y1 / dpi * 72
                             )
-                            page.insert_textbox(rect, item.text, fontsize=0, fill_opacity=0)
+                            # Export používá processed_text pokud je diakritika zapnuta, jinak original/text
+                            txt = item.display_text if hasattr(item, "display_text") else item.text
+                            # Zachovat bbox beze změny – pouze text se mění
+                            page.insert_textbox(rect, txt, fontsize=0, fill_opacity=0)
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
