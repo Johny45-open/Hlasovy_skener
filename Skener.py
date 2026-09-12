@@ -165,9 +165,9 @@ def _split_text_by_page_headers(text: str) -> list[str] | None:
     return pages
 
 
-# ------------------ Dialog pro výběr formátu uložení ------------------
+# ------------------ Dialog pro výběr formátu uložení (legacy) ------------------
 class SaveDocumentDialog(QDialog):
-    """Přístupný dialog 'Uložit dokument' – výběr formátu s lidskými názvy."""
+    """Přístupný dialog 'Uložit dokument' – výběr formátu s lidskými názvy (ponechán pro kompatibilitu makro)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -252,6 +252,160 @@ class SaveDocumentDialog(QDialog):
         return "txt"
 
 
+# ------------------ Dvoustupňové dialogy pro oddělené ukládání ------------------
+class ChooseSaveKindDialog(QDialog):
+    """První krok 'Co chcete uložit?' – odděluje uložení bez OCR a s OCR."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Co chcete uložit?")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        lbl_info = QLabel("Co chcete uložit?")
+        lbl_info.setWordWrap(True)
+        lbl_info.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # accessible name for NVDA heading
+        lbl_info.setAccessibleName("Co chcete uložit")
+        layout.addWidget(lbl_info)
+
+        self.rb_images = QRadioButton("Naskenované stránky")
+        self.rb_images.setAccessibleName("Naskenované stránky")
+        self.rb_images.setAccessibleDescription("Uloží stránky bez OCR jako PDF. Uloží stránky jako obrázky. OCR nebude proveden.")
+        self.rb_images.setChecked(True)
+        layout.addWidget(self.rb_images)
+        lbl_images_desc = QLabel("Uloží stránky bez OCR jako PDF.")
+        lbl_images_desc.setWordWrap(True)
+        lbl_images_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_images_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_images_desc)
+        lbl_images_detail = QLabel("Uloží stránky jako obrázky. OCR nebude proveden.")
+        lbl_images_detail.setWordWrap(True)
+        lbl_images_detail.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_images_detail.setStyleSheet("color: palette(mid); margin-left: 22px; font-style: italic;")
+        layout.addWidget(lbl_images_detail)
+
+        self.rb_ocr = QRadioButton("OCR dokument")
+        self.rb_ocr.setAccessibleName("OCR dokument")
+        self.rb_ocr.setAccessibleDescription("Uloží již rozpoznaný text jako TXT, DOCX nebo PDF s OCR. Vyžaduje předchozí OCR.")
+        layout.addWidget(self.rb_ocr)
+        lbl_ocr_desc = QLabel("Uloží již rozpoznaný text jako TXT, DOCX nebo PDF s OCR.")
+        lbl_ocr_desc.setWordWrap(True)
+        lbl_ocr_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_ocr_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_ocr_desc)
+
+        self._group = QButtonGroup(self)
+        self._group.addButton(self.rb_images, 0)
+        self._group.addButton(self.rb_ocr, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        btn_ok.setText("Pokračovat")
+        btn_ok.setAccessibleName("Pokračovat v ukládání")
+        btn_ok.setDefault(True)
+        btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
+        btn_cancel.setText("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        self.setTabOrder(self.rb_images, self.rb_ocr)
+        self.setTabOrder(self.rb_ocr, btn_ok)
+        self.setTabOrder(btn_ok, btn_cancel)
+        self._btn_ok = btn_ok
+        self._btn_cancel = btn_cancel
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.rb_images.setFocus(Qt.FocusReason.OtherFocusReason)
+        speak("Dialog Co chcete uložit. Vyberte Naskenované stránky bez OCR nebo OCR dokument s rozpoznaným textem.")
+
+    def selected_kind(self) -> str:
+        if self.rb_ocr.isChecked():
+            return "ocr"
+        return "images"
+
+
+class ChooseOcrFormatDialog(QDialog):
+    """Druhý krok – výběr konkrétního OCR formátu."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Uložit OCR dokument")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        lbl_info = QLabel("Vyberte formát OCR dokumentu.")
+        lbl_info.setWordWrap(True)
+        lbl_info.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout.addWidget(lbl_info)
+
+        self.rb_txt = QRadioButton("Textový dokument (.txt)")
+        self.rb_txt.setAccessibleName("Textový dokument (.txt)")
+        self.rb_txt.setAccessibleDescription("Pouhý text bez zachování vzhledu stránky. Vyžaduje OCR.")
+        self.rb_txt.setChecked(True)
+        layout.addWidget(self.rb_txt)
+        lbl_txt_desc = QLabel("Pouhý text bez zachování vzhledu stránky.")
+        lbl_txt_desc.setWordWrap(True)
+        lbl_txt_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_txt_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_txt_desc)
+
+        self.rb_docx = QRadioButton("Word dokument (.docx)")
+        self.rb_docx.setAccessibleName("Word dokument (.docx)")
+        self.rb_docx.setAccessibleDescription("Upravitelný dokument pro Microsoft Word. Vyžaduje OCR.")
+        layout.addWidget(self.rb_docx)
+        lbl_docx_desc = QLabel("Upravitelný dokument pro Microsoft Word a další kompatibilní programy.")
+        lbl_docx_desc.setWordWrap(True)
+        lbl_docx_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_docx_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_docx_desc)
+
+        self.rb_pdf_ocr = QRadioButton("PDF s rozpoznaným textem (.pdf)")
+        self.rb_pdf_ocr.setAccessibleName("PDF s rozpoznaným textem (.pdf)")
+        self.rb_pdf_ocr.setAccessibleDescription("Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR. Vyžaduje OCR.")
+        layout.addWidget(self.rb_pdf_ocr)
+        lbl_pdf_desc = QLabel("Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR.")
+        lbl_pdf_desc.setWordWrap(True)
+        lbl_pdf_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_pdf_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_pdf_desc)
+
+        self._group = QButtonGroup(self)
+        self._group.addButton(self.rb_txt, 0)
+        self._group.addButton(self.rb_docx, 1)
+        self._group.addButton(self.rb_pdf_ocr, 2)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        btn_ok.setText("Uložit")
+        btn_ok.setAccessibleName("Uložit v zvoleném OCR formátu")
+        btn_ok.setDefault(True)
+        btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
+        btn_cancel.setText("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        self.setTabOrder(self.rb_txt, self.rb_docx)
+        self.setTabOrder(self.rb_docx, self.rb_pdf_ocr)
+        self.setTabOrder(self.rb_pdf_ocr, btn_ok)
+        self.setTabOrder(btn_ok, btn_cancel)
+        self._btn_ok = btn_ok
+        self._btn_cancel = btn_cancel
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.rb_txt.setFocus(Qt.FocusReason.OtherFocusReason)
+        speak("Dialog Uložit OCR dokument. Vyberte formát TXT, DOCX nebo PDF s rozpoznaným textem.")
+
+    def selected_format(self) -> str:
+        if self.rb_docx.isChecked():
+            return "docx"
+        if self.rb_pdf_ocr.isChecked():
+            return "pdf_ocr"
+        return "txt"
+
+
 # ------------------ Hlavní aplikace ------------------
 class ScanApp(QWidget):
     def __init__(self) -> None:
@@ -274,6 +428,8 @@ class ScanApp(QWidget):
         self._diacritics_enabled_cache = False
         self._ocr_total_pages: int = 0
         self._ocr_last_announced_page: int = 0
+        # Pro dvoustupňové ukládání – zachování volby přes OCR
+        self._pending_save_format: str | None = None
 
         self.macro_manager = MacroManager()
         self.macro_manager.load_all()
@@ -433,13 +589,19 @@ class ScanApp(QWidget):
         page_btn_layout.addWidget(btn_clear_pages)
         layout.addLayout(page_btn_layout)
 
-        # -- Tlačítka OCR --
+        # -- Tlačítka OCR a uložení – logicky oddělené --
         ocr_btn_layout = QHBoxLayout()
-        self.btn_ocr = QPushButton("OCR a uložit (Ctrl+O)")
-        self.btn_ocr.setAccessibleName("Spustit OCR a uložit")
+        self.btn_ocr = QPushButton("Spustit OCR (Ctrl+O)")
+        self.btn_ocr.setAccessibleName("Spustit OCR – rozpozná text ze stránek")
         self.btn_ocr.clicked.connect(self.run_ocr)
         self.btn_ocr.setEnabled(False)
         ocr_btn_layout.addWidget(self.btn_ocr)
+
+        self.btn_save_document = QPushButton("Uložit dokument (Ctrl+U)")
+        self.btn_save_document.setAccessibleName("Uložit dokument – uloží naskenované stránky nebo rozpoznaný text")
+        self.btn_save_document.clicked.connect(self.save_document)
+        self.btn_save_document.setEnabled(False)
+        ocr_btn_layout.addWidget(self.btn_save_document)
 
         self.btn_read = QPushButton("Přečíst text (Ctrl+P)")
         self.btn_read.setAccessibleName("Přečíst naposledy rozpoznaný text")
@@ -513,7 +675,8 @@ class ScanApp(QWidget):
         self.setTabOrder(self.page_list, btn_delete_page)
         self.setTabOrder(btn_delete_page, btn_clear_pages)
         self.setTabOrder(btn_clear_pages, self.btn_ocr)
-        self.setTabOrder(self.btn_ocr, self.btn_read)
+        self.setTabOrder(self.btn_ocr, self.btn_save_document)
+        self.setTabOrder(self.btn_save_document, self.btn_read)
         self.setTabOrder(self.btn_read, btn_export_img)
 
         # Uložit reference pro testování Tab order a pro focus handling
@@ -581,6 +744,7 @@ class ScanApp(QWidget):
         QShortcut(QKeySequence("Ctrl+Shift+N"), self).activated.connect(self.scan_next_page)
         QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(self.scan_all_pages)
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.run_ocr)
+        QShortcut(QKeySequence("Ctrl+U"), self).activated.connect(self.save_document)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.read_last_text)
         QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self.export_images)
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.close)
@@ -708,6 +872,7 @@ class ScanApp(QWidget):
             self._diacritics_failed = False
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
+            self._update_save_button_state()
         else:
             # No pages – ensure clean state (in case of residual OCR results)
             self.last_ocr_results.clear()
@@ -720,6 +885,7 @@ class ScanApp(QWidget):
         # Keep button states disabled until at least one page succeeds
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
+        self._update_save_button_state()
 
         # Remember count before scanning for correct voice after
         start_count = len(self.scanned_images)
@@ -749,6 +915,7 @@ class ScanApp(QWidget):
 
         if self.scanned_images:
             self.btn_ocr.setEnabled(True)
+            self._update_save_button_state()
             # In new-document mode we cleared page_list, so repopulate.
             # If start_count was 0 we are in new mode; otherwise we already cleared.
             self.page_list.clear()
@@ -757,6 +924,7 @@ class ScanApp(QWidget):
             speak(f"Skenování dokončeno. {len(self.scanned_images)} stránek.")
         else:
             self.btn_scan.setFocus()
+            self._update_save_button_state()
             speak("Skenování dokončeno, žádné stránky.")
 
     def scan_next_page(self) -> None:
@@ -786,6 +954,7 @@ class ScanApp(QWidget):
             self.page_list.addItems([f"Stránka {i+1}" for i in range(new_num)])
 
         self.btn_ocr.setEnabled(True)
+        self._update_save_button_state()
         self.page_list.setCurrentRow(new_num - 1)
         self.page_list.setFocus()
         total = len(self.scanned_images)
@@ -798,6 +967,38 @@ class ScanApp(QWidget):
     def _renumber_pages(self) -> None:
         for i in range(self.page_list.count()):
             self.page_list.item(i).setText(f"Stránka {i+1}")
+
+    # ---------- Helpers pro stav OCR a tlačítko Uložit ----------
+    def _has_ocr_text(self) -> bool:
+        for page in self.last_ocr_results:
+            for item in page:
+                if item.text and item.text.strip():
+                    return True
+        # fallback – _last_text může obsahovat text i bez bbox
+        if self._last_text and self._last_text.strip():
+            # ověř že text není jen headery
+            stripped = re.sub(r"---\s*Stránka\s+\d+\s*---", "", self._last_text).strip()
+            return bool(stripped)
+        return False
+
+    def _is_ocr_empty(self) -> bool:
+        return not self.last_ocr_results or not self._has_ocr_text()
+
+    def _is_ocr_complete(self) -> bool:
+        total = len(self.scanned_images)
+        if total == 0:
+            return False
+        if len(self.last_ocr_results) != total:
+            return False
+        return self._has_ocr_text()
+
+    def _missing_ocr_count(self) -> int:
+        return max(0, len(self.scanned_images) - len(self.last_ocr_results))
+
+    def _update_save_button_state(self) -> None:
+        has_pages = len(self.scanned_images) > 0
+        if hasattr(self, "btn_save_document"):
+            self.btn_save_document.setEnabled(has_pages)
 
     def scan_all_pages(self) -> None:
         old_batch = self.batch_cb.isChecked()
@@ -917,10 +1118,12 @@ class ScanApp(QWidget):
             self._last_original_text = ""
             self._last_edited_pages = None
             self._diacritics_failed = False
+            self._update_save_button_state()
             speak("Všechny stránky smazány.")
             self.btn_scan.setFocus()
         else:
             speak(f"Stránka smazána. Zbývá {remaining} stránek.")
+            self._update_save_button_state()
             # Focus na stejnou pozici nebo poslední
             next_row = min(row, remaining - 1)
             self.page_list.setCurrentRow(next_row)
@@ -956,6 +1159,7 @@ class ScanApp(QWidget):
         self._diacritics_failed = False
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
+        self._update_save_button_state()
         speak(f"Všech {count} stránek smazáno.")
         self.btn_scan.setFocus()
 
@@ -1068,7 +1272,10 @@ class ScanApp(QWidget):
             speak(f"OCR dokončeno pro {total_all} stránek.")
 
         self._ocr_mode = "interactive"
-        self._ocr_show_save_ui(self._last_text)
+        # Pokud je pending save (voláno z Uložit dokument), náhled nezobrazuj – rovnou pokračuj k uložení
+        if getattr(self, "_pending_save_format", None):
+            return
+        self._show_ocr_preview(self._last_text)
 
     def run_ocr(self) -> None:
         if not self.scanned_images:
@@ -1148,13 +1355,6 @@ class ScanApp(QWidget):
         self._start_ocr(images, lang, engine, on_done=loop.quit)
         loop.exec()
 
-    def _has_ocr_text(self) -> bool:
-        for page in self.last_ocr_results:
-            for item in page:
-                if item.text and item.text.strip():
-                    return True
-        return False
-
     def _run_ocr_flow(self, interactive: bool) -> None:
         attempts = self._build_attempts()
         total = len(attempts)
@@ -1172,7 +1372,9 @@ class ScanApp(QWidget):
         if interactive:
             if found:
                 self._ocr_mode = "interactive"
-                self._ocr_show_save_ui(self._last_text)
+                # pending save nesmí zobrazit druhý náhled
+                if not getattr(self, "_pending_save_format", None):
+                    self._show_ocr_preview(self._last_text)
             else:
                 action = self._ask_no_text_action()
                 if action == "rescan":
@@ -1182,7 +1384,8 @@ class ScanApp(QWidget):
                         self._run_ocr_flow(interactive=True)
                 elif action == "continue":
                     self._ocr_mode = "interactive"
-                    self._ocr_show_save_ui(self._last_text)
+                    if not getattr(self, "_pending_save_format", None):
+                        self._show_ocr_preview(self._last_text)
 
     def _ask_no_text_action(self) -> str:
         speak("Nebyl rozpoznán žádný text.")
@@ -1276,107 +1479,279 @@ class ScanApp(QWidget):
         else:
             if total:
                 speak(f"OCR dokončeno pro {total} stránek.")
+        # Pokud běží pending save (OCR spuštěno z dialogu Uložit), nepřekrývej náhledem
+        if getattr(self, "_pending_save_format", None):
+            return
         if self._ocr_mode == "interactive":
-            self._ocr_show_save_ui(full_text)
+            self._show_ocr_preview(full_text)
 
-    def _ocr_show_save_ui(self, full_text: str) -> None:
-        speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit, přečíst nebo uložit.")
+    def _show_ocr_preview(self, full_text: str) -> None:
+        """Zobrazí náhled OCR textu k editaci – SAMOSTATNÝ krok OCR, bez ukládání."""
+        speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit nebo přečíst. Uložení provedete tlačítkem Uložit dokument.")
         dialog = OcrPreviewDialog(full_text, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            # Zrušení náhledu – zachovat OCR výsledky a stránky, vrátit fokus
             self.btn_read.setFocus()
             return
         edited_text = dialog.get_text()
         self._last_text = edited_text
-        # Aktualizuj per-page podle editace
         try:
             pages = _split_text_by_page_headers(edited_text)
             if pages is not None:
                 self._last_edited_pages = pages
             else:
-                # Bez headerů nelze rekonstruovat per-page z edited textu,
-                # ponech původní per-page z full_text/OCR pokud existují
-                # Ale pokud jedna stránka a žádný header, považuj celý text za stránku 1
                 if len(self.scanned_images) == 1:
                     self._last_edited_pages = [edited_text]
                 else:
-                    # Pro více stran bez headerů – neumíme bezpečně rozdělit, ponech None
-                    # DOCX/TXT fallback použije OCR per-page nebo celý text
                     self._last_edited_pages = None
         except Exception:
             self._last_edited_pages = None
+        # Po náhledu nabídni uložení přes samostatné tlačítko, ale ne automaticky
+        # (uživatel stiskne Uložit dokument)
+        self.btn_save_document.setFocus()
+        speak("Náhled uložen. Pro uložení stiskněte Uložit dokument.")
 
-        # Samostatná akce "Uložit dokument" – nejprve výběr formátu
-        speak("Zvolte formát dokumentu k uložení.")
-        fmt_dialog = SaveDocumentDialog(self)
-        if fmt_dialog.exec() != QDialog.DialogCode.Accepted:
-            self.btn_read.setFocus()
+    def _ocr_show_save_ui(self, full_text: str) -> None:
+        """Legacy wrapper – zachován pro makra. Nově jen zobrazí náhled bez auto-uložení."""
+        self._show_ocr_preview(full_text)
+        # Původní auto-uložení odstraněno – oddělení OCR a ukládání.
+
+    # ---------- Uložit dokument – dvoustupňový tok ----------
+    def save_document(self) -> None:
+        """Hlavní vstup pro tlačítko Uložit dokument – nikdy nespouští OCR automaticky."""
+        if not self.scanned_images:
+            QMessageBox.warning(self, "Chyba", "Nejdříve naskenujte stránky.")
+            speak("Žádné stránky k uložení.")
             return
-        fmt = fmt_dialog.selected_format()
+        speak("Otevírám dialog Co chcete uložit.")
+        kind_dlg = ChooseSaveKindDialog(self)
+        if kind_dlg.exec() != QDialog.DialogCode.Accepted:
+            self.page_list.setFocus()
+            return
+        kind = kind_dlg.selected_kind()
+        if kind == "images":
+            self._save_images_only_flow()
+        else:  # ocr
+            fmt_dlg = ChooseOcrFormatDialog(self)
+            if fmt_dlg.exec() != QDialog.DialogCode.Accepted:
+                self.page_list.setFocus()
+                return
+            fmt = fmt_dlg.selected_format()  # txt / docx / pdf_ocr
+            self._pending_save_format = fmt
+            try:
+                self._try_save_with_ocr(fmt)
+            finally:
+                # pokud nebyl spuštěn OCR, vyčisti hned; pokud byl pending save úspěšný, už je vyčištěn
+                if self._pending_save_format == fmt:
+                    # nebyl spuštěn OCR, nebo selhal – vyčisti
+                    self._pending_save_format = None
 
-        # Výchozí název a filtry podle zvoleného formátu
-        filters = {
-            "txt": "Textový dokument (*.txt)",
-            "docx": "Word dokument (*.docx)",
-            "pdf": "PDF s OCR (*.pdf)",
-        }
-        suffixes = {"txt": ".txt", "docx": ".docx", "pdf": ".pdf"}
-        chosen_filter = filters[fmt]
-        suffix = suffixes[fmt]
-        # Výchozí cesta – Dokumenty nebo home
+    def _save_images_only_flow(self) -> None:
+        """PDF bez OCR – používá přímo self.scanned_images, nikdy OCR."""
+        speak("Ukládám PDF bez OCR – pouze obrázky.")
         default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         if not default_dir:
             default_dir = os.path.expanduser("~")
-        default_path = os.path.join(default_dir, "naskenovany_dokument" + suffix)
-
-        speak("Vyberte umístění pro uložení souboru.")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Uložit dokument", default_path, chosen_filter
-        )
+        default_path = os.path.join(default_dir, "naskenovany_dokument.pdf")
+        path, _ = QFileDialog.getSaveFileName(self, "Uložit dokument", default_path, "PDF – naskenované stránky (*.pdf)")
         if not path:
-            self.btn_read.setFocus()
+            self.page_list.setFocus()
             return
-        # Zajistit správnou příponu podle zvoleného formátu
-        if not path.lower().endswith(suffix):
-            # Pokud uživatel zadal jinou příponu, respektuj zvolený formát
-            # (odstraň případnou jinou příponu a přidej správnou)
+        if not path.lower().endswith(".pdf"):
             base, ext = os.path.splitext(path)
             if ext.lower() not in (".txt", ".pdf", ".docx"):
-                path = path + suffix
-            else:
-                # Má jinou známou příponu – nahraď podle formátu
-                if ext.lower() != suffix:
-                    path = base + suffix
-        # Ochrana proti přepsání – QFileDialog již dotazuje nativně, ale pro jistotu
-        # pokud DontConfirmOverwrite není a cesta existuje, Qt již potvrdilo.
-        # Pro ne-nativní fallback ještě ověřit:
+                path = path + ".pdf"
+            elif ext.lower() != ".pdf":
+                path = base + ".pdf"
         if os.path.exists(path):
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Soubor již existuje")
-            msg.setText(f"Soubor již existuje:\n{path}")
-            msg.setInformativeText("Chcete jej přepsat?")
-            btn_over = msg.addButton("Přepsat", QMessageBox.ButtonRole.YesRole)
-            btn_over.setAccessibleName("Ano, přepsat soubor")
-            btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
-            btn_cancel.setAccessibleName("Zrušit, neukládat")
-            msg.setDefaultButton(btn_cancel)
-            msg.exec()
-            if msg.clickedButton() != btn_over:
-                speak("Ukládání zrušeno, soubor nebyl přepsán.")
-                self.btn_read.setFocus()
+            if not self._confirm_overwrite(path):
+                speak("Ukládání zrušeno.")
+                self.page_list.setFocus()
                 return
-
         try:
-            if fmt == "pdf":
-                self._save_pdf(path)
-            elif fmt == "docx":
-                self._save_docx_pages(path)
-            else:
-                self._save_txt_pages(path, edited_text)
+            self._save_pdf_without_ocr(path)
         except Exception as e:
             QMessageBox.critical(self, "Chyba při ukládání", f"Nepodařilo se uložit soubor:\n{e}")
             speak("Chyba při ukládání souboru.")
-            self.btn_read.setFocus()
+            self.page_list.setFocus()
+
+    def _try_save_with_ocr(self, fmt: str) -> None:
+        total = len(self.scanned_images)
+        missing = self._missing_ocr_count()
+        is_empty = self._is_ocr_empty()
+        is_complete = self._is_ocr_complete()
+        # fmt: txt, docx, pdf_ocr
+        if is_complete:
+            self._do_save_ocr_format(fmt)
+            self._pending_save_format = None
+            return
+        # parciální nebo prázdné – zobraz dialog
+        if is_empty:
+            action = self._ask_ocr_not_available(fmt)
+        else:
+            action = self._ask_partial_ocr(missing, total, fmt)
+        if action == "run_ocr":
+            # Spustit OCR a po dokončení automaticky pokračovat
+            self._run_ocr_for_pending_save(fmt)
+        elif action == "save_without" and fmt == "pdf_ocr":
+            # Uživatel chce uložit bez OCR místo s OCR
+            self._pending_save_format = None
+            self._save_images_only_flow()
+        elif action == "cancel":
+            self._pending_save_format = None
+            speak("Ukládání zrušeno.")
+            self.page_list.setFocus()
+        else:
+            # pro txt/docx není save_without – jen cancel/run
+            self._pending_save_format = None
+            speak("Ukládání zrušeno.")
+            self.page_list.setFocus()
+
+    def _ask_ocr_not_available(self, fmt: str) -> str:
+        """Dialog OCR není k dispozici. Vrátí run_ocr / save_without / cancel."""
+        speak("OCR není k dispozici.")
+        fmt_human = {"txt": "TXT", "docx": "DOCX", "pdf_ocr": "PDF s OCR"}[fmt]
+        msg = QMessageBox(self)
+        msg.setWindowTitle("OCR není k dispozici")
+        if fmt == "pdf_ocr":
+            msg.setText("Pro vytvoření PDF s rozpoznaným textem je nejprve potřeba provést OCR.")
+        elif fmt == "txt":
+            msg.setText("Textový obsah zatím není k dispozici, protože nebylo provedeno OCR.")
+        else:
+            msg.setText("Obsah pro Word dokument zatím není k dispozici, protože nebylo provedeno OCR.")
+        msg.setInformativeText(f"Požadovaný formát: {fmt_human}. Co chcete udělat?")
+        btn_run = msg.addButton("Spustit OCR", QMessageBox.ButtonRole.YesRole)
+        btn_run.setAccessibleName("Spustit OCR a poté uložit")
+        btn_run.setAccessibleDescription("Explicitně spustí OCR a po dokončení automaticky uloží dokument.")
+        if fmt == "pdf_ocr":
+            btn_without = msg.addButton("Uložit PDF bez OCR", QMessageBox.ButtonRole.ActionRole)
+            btn_without.setAccessibleName("Uložit PDF bez OCR – pouze obrázky")
+        else:
+            btn_without = None
+        btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        msg.setDefaultButton(btn_run)
+        # Přístupnost: fokus na Spustit OCR
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_run:
+            return "run_ocr"
+        if btn_without is not None and clicked == btn_without:
+            return "save_without"
+        return "cancel"
+
+    def _ask_partial_ocr(self, missing: int, total: int, fmt: str) -> str:
+        speak("Některé stránky nemají OCR.")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Chybějící OCR")
+        msg.setText(f"Některé stránky ještě nemají OCR ({total-missing} z {total} má OCR, chybí {missing}). Chcete nejprve spustit OCR pro chybějící stránky?")
+        fmt_human = {"txt": "TXT", "docx": "DOCX", "pdf_ocr": "PDF s OCR"}[fmt]
+        msg.setInformativeText(f"Požadovaný formát: {fmt_human}. Chybějící stránky lze rozpoznat doplňkovým OCR.")
+        btn_run = msg.addButton("Spustit OCR", QMessageBox.ButtonRole.YesRole)
+        btn_run.setAccessibleName("Spustit OCR pro chybějící stránky a poté uložit")
+        if fmt == "pdf_ocr":
+            btn_without = msg.addButton("Uložit bez OCR", QMessageBox.ButtonRole.ActionRole)
+            btn_without.setAccessibleName("Uložit všechny stránky bez OCR")
+        else:
+            btn_without = None
+        btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        msg.setDefaultButton(btn_run)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_run:
+            return "run_ocr"
+        if btn_without is not None and clicked == btn_without:
+            return "save_without"
+        return "cancel"
+
+    def _run_ocr_for_pending_save(self, fmt: str) -> None:
+        """Spustí OCR explicitně a po úspěchu automaticky uloží pending formát."""
+        # zachovej fmt v self._pending_save_format (už nastaveno)
+        total_before = len(self.scanned_images)
+        try:
+            if self._is_ocr_empty():
+                # full OCR
+                self._ocr_total_pages = total_before
+                self._ocr_last_announced_page = 0
+                speak(f"Spouštím OCR pro uložení {fmt}, celkem {total_before} stránek.")
+                self._run_ocr_flow(interactive=False)
+                # _run_ocr_flow v non-interactive neukazuje preview, ale nastaví _last_text
+                # pokud našlo text, pokračuj k uložení
+            else:
+                # incremental – doplnit chybějící
+                missing_start = len(self.last_ocr_results)
+                self._run_ocr_incremental(missing_start)
+                # _run_ocr_incremental už vrací pokud pending, bez preview
+        except Exception as e:
+            QMessageBox.critical(self, "Chyba OCR", f"OCR selhalo:\n{e}")
+            speak("OCR selhalo.")
+            self._pending_save_format = None
+            return
+        # Ověř že OCR nyní kompletní
+        if self._is_ocr_empty() or not self._has_ocr_text():
+            QMessageBox.warning(self, "OCR bez výsledku", "OCR bylo dokončeno, ale nebyl rozpoznán žádný text. Dokument nebude uložen.")
+            speak("OCR neprodukovalo text.")
+            self._pending_save_format = None
+            return
+        # Automaticky pokračovat v původně zvoleném ukládání
+        try:
+            self._do_save_ocr_format(fmt)
+        finally:
+            self._pending_save_format = None
+
+    def _do_save_ocr_format(self, fmt: str) -> None:
+        """Uloží OCR formát – voláno pouze když OCR existuje, nikdy nespouští OCR."""
+        # vyber filtr a příponu
+        filters = {"txt": "Textový dokument (*.txt)", "docx": "Word dokument (*.docx)", "pdf_ocr": "PDF s rozpoznaným textem (*.pdf)"}
+        suffixes = {"txt": ".txt", "docx": ".docx", "pdf_ocr": ".pdf"}
+        chosen_filter = filters[fmt]
+        suffix = suffixes[fmt]
+        default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        if not default_dir:
+            default_dir = os.path.expanduser("~")
+        name_map = {"txt": "naskenovany_dokument.txt", "docx": "naskenovany_dokument.docx", "pdf_ocr": "naskenovany_dokument.pdf"}
+        default_path = os.path.join(default_dir, name_map[fmt])
+        speak("Vyberte umístění pro uložení souboru.")
+        path, _ = QFileDialog.getSaveFileName(self, "Uložit dokument", default_path, chosen_filter)
+        if not path:
+            self.page_list.setFocus()
+            return
+        if not path.lower().endswith(suffix):
+            base, ext = os.path.splitext(path)
+            if ext.lower() not in (".txt", ".pdf", ".docx"):
+                path = path + suffix
+            elif ext.lower() != suffix:
+                path = base + suffix
+        if os.path.exists(path):
+            if not self._confirm_overwrite(path):
+                speak("Ukládání zrušeno.")
+                self.page_list.setFocus()
+                return
+        try:
+            if fmt == "pdf_ocr":
+                self._save_pdf_with_ocr(path)
+            elif fmt == "docx":
+                self._save_docx_pages(path)
+            else:
+                # pro TXT použij _last_text (již obsahuje headery)
+                self._save_txt_pages(path, self._last_text)
+        except Exception as e:
+            QMessageBox.critical(self, "Chyba při ukládání", f"Nepodařilo se uložit soubor:\n{e}")
+            speak("Chyba při ukládání souboru.")
+            self.page_list.setFocus()
+
+    def _confirm_overwrite(self, path: str) -> bool:
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Soubor již existuje")
+        msg.setText(f"Soubor již existuje:\n{path}")
+        msg.setInformativeText("Chcete jej přepsat?")
+        btn_over = msg.addButton("Přepsat", QMessageBox.ButtonRole.YesRole)
+        btn_over.setAccessibleName("Ano, přepsat soubor")
+        btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+        btn_cancel.setAccessibleName("Zrušit, neukládat")
+        msg.setDefaultButton(btn_cancel)
+        msg.exec()
+        return msg.clickedButton() == btn_over
 
     def read_last_text(self) -> None:
         # Při zapnuté opravě čte processed_text (už v _last_text), jinak originál
@@ -1534,37 +1909,51 @@ class ScanApp(QWidget):
             f.write(content)
         self._show_save_success(path, "Textový dokument (.txt)", "Textový dokument")
 
-    def _save_pdf(self, path: str) -> None:
+    def _save_pdf_without_ocr(self, path: str) -> None:
+        """Uloží stránky jako obrázky. OCR nebude proveden. Použije přímo self.scanned_images."""
         doc = fitz.open()
         dpi = self.dpi_combo.currentData()
         if dpi is None:
             dpi = 300
-        for i, img in enumerate(self.scanned_images):
-            page = doc.new_page(
-                width=img.width / dpi * 72,
-                height=img.height / dpi * 72
-            )
-
+        for img in self.scanned_images:
+            page = doc.new_page(width=img.width / dpi * 72, height=img.height / dpi * 72)
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                     tmp_path = tmp.name
                     img.save(tmp_path, "JPEG", quality=95)
                 page.insert_image(page.rect, filename=tmp_path)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        doc.save(path)
+        self._show_save_success(path, "PDF – naskenované stránky (.pdf)", "PDF bez OCR")
 
+    def _save_pdf_with_ocr(self, path: str) -> None:
+        """Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR. Použije self.last_ocr_results, nespouští OCR."""
+        doc = fitz.open()
+        dpi = self.dpi_combo.currentData()
+        if dpi is None:
+            dpi = 300
+        for i, img in enumerate(self.scanned_images):
+            page = doc.new_page(width=img.width / dpi * 72, height=img.height / dpi * 72)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp_path = tmp.name
+                    img.save(tmp_path, "JPEG", quality=95)
+                page.insert_image(page.rect, filename=tmp_path)
                 if i < len(self.last_ocr_results):
                     for item in self.last_ocr_results[i]:
                         if item.bbox is not None:
                             bbox = item.bbox
                             x0, y0 = bbox[0][0], bbox[0][1]
                             x1, y1 = bbox[2][0], bbox[2][1]
-                            rect = fitz.Rect(
-                                x0 / dpi * 72, y0 / dpi * 72,
-                                x1 / dpi * 72, y1 / dpi * 72
-                            )
-                            # Export používá processed_text pokud je diakritika zapnuta, jinak original/text
+                            rect = fitz.Rect(x0 / dpi * 72, y0 / dpi * 72, x1 / dpi * 72, y1 / dpi * 72)
                             txt = item.display_text if hasattr(item, "display_text") else item.text
-                            # Zachovat bbox beze změny – pouze text se mění
                             page.insert_textbox(rect, txt, fontsize=0, fill_opacity=0)
             finally:
                 if tmp_path and os.path.exists(tmp_path):
@@ -1572,9 +1961,20 @@ class ScanApp(QWidget):
                         os.remove(tmp_path)
                     except OSError:
                         pass
-
         doc.save(path)
-        self._show_save_success(path, "PDF s OCR (.pdf)", "PDF")
+        self._show_save_success(path, "PDF s rozpoznaným textem (.pdf)", "PDF s OCR")
+
+    def _save_pdf(self, path: str) -> None:
+        """Legacy alias – pro kompatibilitu volá _save_pdf_with_ocr pokud existuje OCR, jinak bez."""
+        if self._is_ocr_complete():
+            self._save_pdf_with_ocr(path)
+        else:
+            # zachovej původní chování – vlož OCR vrstvu pokud existuje částečně
+            # ale nový tok by měl volat explicitně jednu z variant
+            if self.last_ocr_results:
+                self._save_pdf_with_ocr(path)
+            else:
+                self._save_pdf_without_ocr(path)
 
     def _save_docx(self, text: str, path: str) -> None:
         """Legacy wrapper – zachován pro kompatibilitu (makra). Nově volá per-page logiku."""
