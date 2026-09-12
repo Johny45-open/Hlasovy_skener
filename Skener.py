@@ -98,10 +98,14 @@ class PreviewDialog(QDialog):
 
 # ------------------ Dialog pro editaci OCR výsledku ------------------
 class OcrPreviewDialog(QDialog):
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+    RESULT_RETRY = 2  # vlastní kód pro „Zkusit jiný engine“
+
+    def __init__(self, text: str, parent: QWidget | None = None, alt_engine_name: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("Náhled OCR textu")
         self.setMinimumSize(600, 400)
+        self._result_action = "reject"  # accept | retry | reject
+        self._alt_engine_name = alt_engine_name
 
         self.text_edit = QTextEdit()
         self.text_edit.setPlainText(text)
@@ -113,20 +117,54 @@ class OcrPreviewDialog(QDialog):
         btn_read.clicked.connect(self.read_text)
         btn_layout.addWidget(btn_read)
 
-        btn_save = QPushButton("Uložit")
-        btn_save.setAccessibleName("Uložit a pokračovat")
+        btn_save = QPushButton("Použít aktuální výsledek")
+        btn_save.setAccessibleName("Použít aktuální výsledek a pokračovat")
         btn_save.setDefault(True)
-        btn_save.clicked.connect(self.accept)
+        btn_save.clicked.connect(self._on_accept)
         btn_layout.addWidget(btn_save)
+        self._btn_save = btn_save
+
+        self._btn_retry: QPushButton | None = None
+        if alt_engine_name:
+            btn_retry = QPushButton("Zkusit jiný OCR engine")
+            # Jednorázový pokus, nemění engine_combo
+            btn_retry.setAccessibleName(f"Zkusit jiný OCR engine – {alt_engine_name}")
+            btn_retry.setAccessibleDescription("Spustí jednorázové OCR druhým enginem. Původní výsledek zůstane zachován do úspěchu nového pokusu.")
+            btn_retry.clicked.connect(self._on_retry)
+            btn_layout.addWidget(btn_retry)
+            self._btn_retry = btn_retry
 
         btn_cancel = QPushButton("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit")
         btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancel)
+        self._btn_cancel = btn_cancel
 
         layout = QVBoxLayout()
         layout.addWidget(self.text_edit)
         layout.addLayout(btn_layout)
         self.setLayout(layout)
+
+        # Tab order: text_edit -> Přečíst -> Použít -> Zkusit jiný -> Zrušit
+        self.setTabOrder(self.text_edit, btn_read)
+        self.setTabOrder(btn_read, btn_save)
+        if self._btn_retry is not None:
+            self.setTabOrder(btn_save, self._btn_retry)
+            self.setTabOrder(self._btn_retry, btn_cancel)
+        else:
+            self.setTabOrder(btn_save, btn_cancel)
+
+    def _on_accept(self) -> None:
+        self._result_action = "accept"
+        self.accept()
+
+    def _on_retry(self) -> None:
+        self._result_action = "retry"
+        # Ukončit dialog s vlastním kódem
+        self.done(OcrPreviewDialog.RESULT_RETRY)
+
+    def result_action(self) -> str:
+        return self._result_action
 
     def read_text(self) -> None:
         speak(self.text_edit.toPlainText())
@@ -134,6 +172,8 @@ class OcrPreviewDialog(QDialog):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self.text_edit.setFocus()
+        if self._alt_engine_name:
+            speak(f"Náhled OCR dokončen. Můžete použít aktuální výsledek nebo zkusit jiný OCR engine {self._alt_engine_name}.")
 
     def get_text(self) -> str:
         return self.text_edit.toPlainText()
@@ -1275,7 +1315,7 @@ class ScanApp(QWidget):
         # Pokud je pending save (voláno z Uložit dokument), náhled nezobrazuj – rovnou pokračuj k uložení
         if getattr(self, "_pending_save_format", None):
             return
-        self._show_ocr_preview(self._last_text)
+        self._show_ocr_preview(self._last_text, is_incremental=True, incremental_start_idx=start_idx)
 
     def run_ocr(self) -> None:
         if not self.scanned_images:
@@ -1324,29 +1364,16 @@ class ScanApp(QWidget):
         self.progress_dialog.show()
         self.ocr_thread.start()
 
+    def _get_alternate_engine(self, engine: str) -> str:
+        return "EasyOCR" if engine == "Tesseract" else "Tesseract"
+
     def _build_attempts(self) -> list[tuple[str, str, list[Image.Image]]]:
+        # Zachováno pro kompatibilitu / explicitní retry pokud bude potřeba,
+        # ale automatický fallback již není používán. Vrací pouze jednorázový
+        # pokus s aktuálním nastavením uživatele.
         base_engine = self.engine_combo.currentText()
         base_lang = self.lang_combo.currentText()
-        alt_engine = "EasyOCR" if base_engine == "Tesseract" else "Tesseract"
-
-        attempts: list[tuple[str, str, list[Image.Image]]] = [
-            (base_engine, base_lang, list(self.scanned_images)),
-            (alt_engine, base_lang, list(self.scanned_images)),
-        ]
-
-        for alt_lang in [
-            "eng (Angličtina)", "ces (Čeština)", "deu (Němčina)",
-            "fra (Francouzština)", "ita (Italština)", "pol (Polština)",
-        ]:
-            if alt_lang != base_lang:
-                attempts.append((base_engine, alt_lang, list(self.scanned_images)))
-                attempts.append((alt_engine, alt_lang, list(self.scanned_images)))
-
-        alt_images = [alt_preprocess_image(r) for r in self.raw_scanned_images]
-        if alt_images:
-            attempts.append((base_engine, base_lang, alt_images))
-            attempts.append((alt_engine, base_lang, alt_images))
-        return attempts
+        return [(base_engine, base_lang, list(self.scanned_images))]
 
     def _run_ocr_once(
         self, lang: str, engine: str, images: list[Image.Image]
@@ -1355,29 +1382,42 @@ class ScanApp(QWidget):
         self._start_ocr(images, lang, engine, on_done=loop.quit)
         loop.exec()
 
+    def _run_single_attempt(
+        self, engine: str, lang: str, images: list[Image.Image]
+    ) -> bool:
+        """Spustí JEDEN OCR pokus a vrátí True pokud byl úspěšný (platný text)."""
+        if self._scan_cancelled:
+            return False
+        self._ocr_mode = "macro"
+        self._run_ocr_once(lang, engine, images)
+        return self._has_ocr_text()
+
     def _run_ocr_flow(self, interactive: bool) -> None:
-        attempts = self._build_attempts()
-        total = len(attempts)
-        found = False
-        for i, (engine, lang, images) in enumerate(attempts, start=1):
-            if self._scan_cancelled:
-                break
-            speak(f"OCR pokus {i} z {total}.")
-            self._ocr_mode = "macro"
-            self._run_ocr_once(lang, engine, images)
-            if self._has_ocr_text():
-                found = True
-                break
+        """Nové chování: první úspěšný výsledek stačí. Žádný automatický fallback.
+
+        1. Uživatel zvolí engine/lang → jeden pokus.
+        2. Pokud vrátí platný text → považováno za dokončené, nabídnout retry pouze explicitně.
+        3. Pokud selže → nabídnout volby včetně „Zkusit jiný engine“ (explicitně).
+        """
+        base_engine = self.engine_combo.currentText()
+        base_lang = self.lang_combo.currentText()
+        images = list(self.scanned_images)
+        found = self._run_single_attempt(base_engine, base_lang, images)
 
         if interactive:
             if found:
                 self._ocr_mode = "interactive"
+                used_engine = base_engine
+                # Krátké oznámení – engine, ne technické detaily
+                speak(f"OCR dokončeno, použit {used_engine}.")
                 # pending save nesmí zobrazit druhý náhled
                 if not getattr(self, "_pending_save_format", None):
                     self._show_ocr_preview(self._last_text)
             else:
                 action = self._ask_no_text_action()
-                if action == "rescan":
+                if action == "retry_other":
+                    self._retry_with_alternate_engine(interactive=True)
+                elif action == "rescan":
                     speak("Znovu skenuji stránky a opakuji OCR.")
                     self.scan_pages()
                     if self.scanned_images:
@@ -1387,20 +1427,198 @@ class ScanApp(QWidget):
                     if not getattr(self, "_pending_save_format", None):
                         self._show_ocr_preview(self._last_text)
 
+    def _retry_with_alternate_engine(self, interactive: bool = True) -> None:
+        """Jednorázový explicitní pokus druhým enginem. Nemění engine_combo.
+
+        Zachová původní výsledek do úspěchu nového pokusu. Při selhání obnoví původní.
+        """
+        base_engine = self.engine_combo.currentText()
+        alt_engine = self._get_alternate_engine(base_engine)
+        lang = self.lang_combo.currentText()
+        images = list(self.scanned_images)
+        # Snapshot pro případ selhání
+        backup_results = list(self.last_ocr_results)
+        backup_text = self._last_text
+        backup_pages = self._last_edited_pages
+        backup_original = self._last_original_text
+        backup_total = getattr(self, "_ocr_total_pages", 0)
+        backup_announced = getattr(self, "_ocr_last_announced_page", 0)
+
+        speak(f"Zkouším jiný OCR engine {alt_engine}.")
+        # Dočasně přepnout počitadla pro progress
+        self._ocr_total_pages = len(images)
+        self._ocr_last_announced_page = 0
+        self._run_ocr_once(lang, alt_engine, images)
+        if not self._has_ocr_text():
+            # Obnovit původní výsledek
+            self.last_ocr_results = backup_results
+            self._last_text = backup_text
+            self._last_edited_pages = backup_pages
+            self._last_original_text = backup_original
+            self._ocr_total_pages = backup_total
+            self._ocr_last_announced_page = backup_announced
+            QMessageBox.warning(self, "OCR bez výsledku", f"Pokus s {alt_engine} neprodukoval žádný text. Původní výsledek byl zachován.")
+            speak("Nový pokus selhal, původní výsledek zachován.")
+            if interactive and not getattr(self, "_pending_save_format", None):
+                # Nabídnout znovu náhled původního výsledku pokud existoval
+                if backup_text and backup_text.strip():
+                    self._show_ocr_preview(self._last_text)
+            return
+        # Úspěch – zachovat nový výsledek (engine_combo se nemění)
+        speak(f"OCR dokončeno, použit {alt_engine}.")
+        if interactive and not getattr(self, "_pending_save_format", None):
+            self._ocr_mode = "interactive"
+            self._show_ocr_preview(self._last_text)
+
+    def _retry_incremental_with_alternate_engine(self, start_idx: int) -> None:
+        """Jednorázový retry pouze pro nově přidané stránky (start_idx..). Nemění engine_combo."""
+        new_images = self.scanned_images[start_idx:]
+        if not new_images:
+            return
+        base_engine = self.engine_combo.currentText()
+        alt_engine = self._get_alternate_engine(base_engine)
+        lang = self.lang_combo.currentText()
+        # Snapshot před retry
+        backup_results = list(self.last_ocr_results)
+        backup_text = self._last_text
+        backup_pages = self._last_edited_pages
+        backup_original = self._last_original_text
+
+        speak(f"Zkouším jiný OCR engine {alt_engine} pro nové stránky.")
+        # Provést jednorázový pokus na new_images
+        new_results_holder: list[list[OcrResult]] = []
+        new_text_holder: list[str] = []
+        loop = QEventLoop()
+
+        def on_results(r):
+            new_results_holder.clear()
+            new_results_holder.extend(r)
+
+        def on_finished(txt: str):
+            new_text_holder.append(txt)
+            loop.quit()
+
+        diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
+        self._diacritics_failed = False
+        self._diacritics_enabled_cache = diac_enabled
+        # Dočasné hodnoty pro progress
+        prev_total = getattr(self, "_ocr_total_pages", 0)
+        prev_announced = getattr(self, "_ocr_last_announced_page", 0)
+        self._ocr_total_pages = len(self.scanned_images)
+        self._ocr_last_announced_page = start_idx
+        self.ocr_thread = create_ocr_thread(alt_engine, new_images, lang, diacritics_enabled=diac_enabled)
+        self.ocr_thread.ocr_results.connect(on_results)
+        self.ocr_thread.finished.connect(on_finished)
+        if hasattr(self.ocr_thread, "diacritics_failed"):
+            self.ocr_thread.diacritics_failed.connect(self._on_diacritics_failed)
+        if alt_engine == "EasyOCR":
+            self.progress_dialog = QProgressDialog("Načítám EasyOCR model...", "Zrušit", 0, 0, self)
+            self.ocr_thread.model_loading.connect(self._on_model_loaded)
+        else:
+            self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
+        self.ocr_thread.progress.connect(self._on_ocr_progress)
+        self.progress_dialog.show()
+        self.ocr_thread.start()
+        loop.exec()
+        self.progress_dialog.cancel()
+
+        # Kontrola úspěchu pro nové stránky
+        has_text = False
+        for page in new_results_holder:
+            for item in page:
+                if item.text and item.text.strip():
+                    has_text = True
+                    break
+            if has_text:
+                break
+        # Fallback přes text pokud results prázdné ale full_text něco obsahuje
+        if not has_text and new_text_holder and new_text_holder[0].strip():
+            stripped = re.sub(r"---\s*Stránka\s+\d+\s*---", "", new_text_holder[0]).strip()
+            has_text = bool(stripped)
+
+        if not has_text or not new_results_holder:
+            # Obnovit (incremental ještě nic nemergoval – stačí vrátit backup)
+            self.last_ocr_results = backup_results
+            self._last_text = backup_text
+            self._last_edited_pages = backup_pages
+            self._last_original_text = backup_original
+            self._ocr_total_pages = prev_total
+            self._ocr_last_announced_page = prev_announced
+            QMessageBox.warning(self, "OCR bez výsledku", f"Pokus s {alt_engine} pro nové stránky neprodukoval text. Původní výsledek zachován.")
+            speak("Nový pokus selhal, původní výsledek zachován.")
+            # Zobrazit původní náhled pokud existoval
+            if backup_text and backup_text.strip():
+                self._show_ocr_preview(self._last_text, is_incremental=True, incremental_start_idx=start_idx)
+            return
+        # Úspěch – merge stejně jako v _run_ocr_incremental
+        old_results = backup_results[:start_idx] if len(backup_results) >= start_idx else backup_results
+        # Pokud backup byl prázdný, všechny jsou nové
+        if not old_results and start_idx == 0:
+            old_results = []
+        # Přegeneruj corrected_new_text s posunutým číslováním
+        corrected_new_text = ""
+        for i, page_results in enumerate(new_results_holder):
+            page_num = start_idx + i + 1
+            page_text_parts = [r.display_text for r in page_results]
+            page_text = "\n".join(page_text_parts)
+            corrected_new_text += f"--- Stránka {page_num} ---\n{page_text}\n\n"
+        # Merge results
+        self.last_ocr_results = old_results + new_results_holder
+        # Merge text
+        old_text_for_merge = backup_text if backup_text else ""
+        # Pokud starý text existoval, připoj nové; jinak použij corrected
+        # Pro případ kdy old_text neobsahuje nové stránky, rekonstruuj správně
+        if start_idx == 0:
+            self._last_text = corrected_new_text
+        else:
+            # Ořízni backup na start_idx stránek pokud byl již kompletní
+            if backup_text and backup_text.strip():
+                self._last_text = old_text_for_merge.rstrip() + "\n\n" + corrected_new_text if old_text_for_merge.strip() else corrected_new_text
+            else:
+                self._last_text = corrected_new_text
+        try:
+            pages = _split_text_by_page_headers(self._last_text)
+            if pages is not None and len(pages) == len(self.last_ocr_results):
+                self._last_edited_pages = pages
+            else:
+                self._last_edited_pages = None
+        except Exception:
+            self._last_edited_pages = None
+        try:
+            orig_parts = []
+            for idx, page in enumerate(self.last_ocr_results):
+                if page:
+                    texts = [r.original_text if r.original_text is not None else r.text for r in page]
+                    orig_parts.append(f"--- Stránka {idx + 1} ---\n" + "\n".join(texts) + "\n\n")
+            self._last_original_text = "".join(orig_parts) if any(orig_parts) else self._last_text
+        except Exception:
+            self._last_original_text = self._last_text
+        self.btn_read.setEnabled(True)
+        speak(f"OCR dokončeno, použit {alt_engine}.")
+        if not getattr(self, "_pending_save_format", None):
+            self._show_ocr_preview(self._last_text, is_incremental=True, incremental_start_idx=start_idx)
+
     def _ask_no_text_action(self) -> str:
         speak("Nebyl rozpoznán žádný text.")
+        base_engine = self.engine_combo.currentText()
+        alt_engine = self._get_alternate_engine(base_engine)
         msg = QMessageBox(self)
         msg.setWindowTitle("Nerozpoznán žádný text")
-        msg.setText("Po všech pokusech nebyl rozpoznán žádný text.")
+        msg.setText(f"Zvolený engine {base_engine} nerozpoznal žádný text.")
         msg.setInformativeText("Co chcete udělat?")
+        btn_retry = msg.addButton(f"Zkusit jiný OCR engine ({alt_engine})", QMessageBox.ButtonRole.ActionRole)
+        btn_retry.setAccessibleName(f"Zkusit jiný OCR engine {alt_engine}")
+        btn_retry.setAccessibleDescription("Spustí jednorázový pokus druhým enginem. Původní výsledek zůstane zachován.")
         btn_rescan = msg.addButton("Znovu naskenovat", QMessageBox.ButtonRole.YesRole)
         btn_rescan.setAccessibleName("Znovu naskenovat stránky")
-        btn_cont = msg.addButton("Pokračovat k uložení", QMessageBox.ButtonRole.ActionRole)
+        btn_cont = msg.addButton("Pokračovat k náhledu", QMessageBox.ButtonRole.ActionRole)
         btn_cont.setAccessibleName("Pokračovat k náhledu a uložení")
         btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
         btn_cancel.setAccessibleName("Zrušit")
         msg.exec()
         clicked = msg.clickedButton()
+        if clicked == btn_retry:
+            return "retry_other"
         if clicked == btn_rescan:
             return "rescan"
         if clicked == btn_cont:
@@ -1408,10 +1626,13 @@ class ScanApp(QWidget):
         return "cancel"
 
     def _execute_ocr(self) -> None:
-        # Ensure per-page announcements also work for macro/non-interactive path
+        # Makro / neinteraktivní cesta – také single-attempt, bez automatického fallbacku
         self._ocr_total_pages = len(self.scanned_images)
         self._ocr_last_announced_page = 0
-        self._run_ocr_flow(interactive=False)
+        base_engine = self.engine_combo.currentText()
+        base_lang = self.lang_combo.currentText()
+        # Jednorázový pokus, výsledek v last_ocr_results / _last_text via _ocr_finished
+        self._run_single_attempt(base_engine, base_lang, list(self.scanned_images))
 
     def _on_ocr_progress(self, value: int) -> None:
         self.progress_dialog.setValue(value)
@@ -1485,11 +1706,24 @@ class ScanApp(QWidget):
         if self._ocr_mode == "interactive":
             self._show_ocr_preview(full_text)
 
-    def _show_ocr_preview(self, full_text: str) -> None:
-        """Zobrazí náhled OCR textu k editaci – SAMOSTATNÝ krok OCR, bez ukládání."""
+    def _show_ocr_preview(self, full_text: str, is_incremental: bool = False, incremental_start_idx: int = 0) -> None:
+        """Zobrazí náhled OCR textu k editaci – SAMOSTATNÝ krok OCR, bez ukládání.
+
+        Obsahuje explicitní volbu „Zkusit jiný OCR engine“ (jednorázový pokus, nemění engine_combo).
+        Retry se týká celého dokumentu, u inkrementálního pouze nově přidaných stránek.
+        """
         speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit nebo přečíst. Uložení provedete tlačítkem Uložit dokument.")
-        dialog = OcrPreviewDialog(full_text, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        alt_engine = self._get_alternate_engine(self.engine_combo.currentText()) if hasattr(self, "engine_combo") else ""
+        dialog = OcrPreviewDialog(full_text, self, alt_engine_name=alt_engine)
+        result = dialog.exec()
+        if result == OcrPreviewDialog.RESULT_RETRY:
+            # Explicitní žádost – jednorázový pokus druhým enginem, původní výsledek zachován do úspěchu
+            if is_incremental:
+                self._retry_incremental_with_alternate_engine(incremental_start_idx)
+            else:
+                self._retry_with_alternate_engine(interactive=True)
+            return
+        if result != QDialog.DialogCode.Accepted:
             self.btn_read.setFocus()
             return
         edited_text = dialog.get_text()
