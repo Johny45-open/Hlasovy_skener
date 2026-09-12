@@ -8,10 +8,11 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QMessageBox, QFileDialog, QDialog, QListWidget,
     QProgressDialog, QTextEdit, QCheckBox, QAbstractItemView, QGroupBox,
-    QInputDialog, QScrollArea
+    QInputDialog, QScrollArea, QRadioButton, QDialogButtonBox, QButtonGroup
 )
 from PyQt6.QtGui import QPixmap, QShortcut, QKeySequence
-from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer
+from PyQt6.QtCore import Qt, QEventLoop, QSettings, QTimer, QStandardPaths
+import re
 
 # QAccessible není v PyQt6 6.11+ exponován v Python API (ověřeno
 # ImportError: cannot import name 'QAccessible' from 'PyQt6.QtGui').
@@ -137,6 +138,120 @@ class OcrPreviewDialog(QDialog):
     def get_text(self) -> str:
         return self.text_edit.toPlainText()
 
+
+# ------------------ Pomocné funkce pro stránkování ------------------
+_PAGE_HEADER_RE = re.compile(r"^---\s*Stránka\s+(\d+)\s*---\s*$", re.MULTILINE)
+
+
+def _split_text_by_page_headers(text: str) -> list[str] | None:
+    """Rozdělí text podle headerů '--- Stránka N ---' na list per-page.
+
+    Vrátí None pokud text neobsahuje žádné headery nebo je neplatný.
+    """
+    if not text or "--- Stránka" not in text:
+        return None
+    # Najdi všechny headery
+    matches = list(_PAGE_HEADER_RE.finditer(text))
+    if not matches:
+        return None
+    pages: list[str] = []
+    for idx, m in enumerate(matches):
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        page_content = text[start:end].strip("\n")
+        # Odstraň přebytečné okolní nové řádky, ale zachovej vnitřní
+        # strip jen koncové \n, pak strip surrounding whitespace per page
+        pages.append(page_content.strip())
+    return pages
+
+
+# ------------------ Dialog pro výběr formátu uložení ------------------
+class SaveDocumentDialog(QDialog):
+    """Přístupný dialog 'Uložit dokument' – výběr formátu s lidskými názvy."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Uložit dokument")
+        self.setMinimumWidth(520)
+        self._selected_format: str = "txt"
+
+        layout = QVBoxLayout(self)
+
+        lbl_info = QLabel("Vyberte formát, ve kterém chcete dokument uložit.")
+        lbl_info.setWordWrap(True)
+        lbl_info.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout.addWidget(lbl_info)
+
+        # Radio buttons s lidskými názvy a popisem
+        self.rb_txt = QRadioButton("Textový dokument (.txt)")
+        self.rb_txt.setAccessibleName("Textový dokument (.txt)")
+        self.rb_txt.setAccessibleDescription("Pouhý text bez zachování vzhledu stránky.")
+        self.rb_txt.setChecked(True)
+        layout.addWidget(self.rb_txt)
+        lbl_txt_desc = QLabel("Pouhý text bez zachování vzhledu stránky.")
+        lbl_txt_desc.setWordWrap(True)
+        lbl_txt_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_txt_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_txt_desc)
+
+        self.rb_docx = QRadioButton("Word dokument (.docx)")
+        self.rb_docx.setAccessibleName("Word dokument (.docx)")
+        self.rb_docx.setAccessibleDescription("Upravitelný dokument pro Microsoft Word a další kompatibilní programy.")
+        layout.addWidget(self.rb_docx)
+        lbl_docx_desc = QLabel("Upravitelný dokument pro Microsoft Word a další kompatibilní programy.")
+        lbl_docx_desc.setWordWrap(True)
+        lbl_docx_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_docx_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_docx_desc)
+
+        self.rb_pdf = QRadioButton("PDF s OCR (.pdf)")
+        self.rb_pdf.setAccessibleName("PDF s OCR (.pdf)")
+        self.rb_pdf.setAccessibleDescription("Dokument se zachovaným vzhledem stránek a skrytou textovou vrstvou pro vyhledávání a odečítání textu.")
+        layout.addWidget(self.rb_pdf)
+        lbl_pdf_desc = QLabel("Dokument se zachovaným vzhledem stránek a skrytou textovou vrstvou pro vyhledávání a odečítání textu.")
+        lbl_pdf_desc.setWordWrap(True)
+        lbl_pdf_desc.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_pdf_desc.setStyleSheet("color: palette(mid); margin-left: 22px;")
+        layout.addWidget(lbl_pdf_desc)
+
+        # Button group pro logické propojení
+        self._group = QButtonGroup(self)
+        self._group.addButton(self.rb_txt, 0)
+        self._group.addButton(self.rb_docx, 1)
+        self._group.addButton(self.rb_pdf, 2)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        btn_ok.setText("Uložit")
+        btn_ok.setAccessibleName("Uložit v zvoleném formátu")
+        btn_ok.setDefault(True)
+        btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
+        btn_cancel.setText("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+        # Tab order je přirozený: rb_txt -> rb_docx -> rb_pdf -> Ok -> Cancel
+        self.setTabOrder(self.rb_txt, self.rb_docx)
+        self.setTabOrder(self.rb_docx, self.rb_pdf)
+        self.setTabOrder(self.rb_pdf, btn_ok)
+        self.setTabOrder(btn_ok, btn_cancel)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Počáteční fokus na první volbu
+        self.rb_txt.setFocus(Qt.FocusReason.OtherFocusReason)
+        speak("Dialog Uložit dokument. Vyberte formát, ve kterém chcete dokument uložit.")
+
+    def selected_format(self) -> str:
+        if self.rb_docx.isChecked():
+            return "docx"
+        if self.rb_pdf.isChecked():
+            return "pdf"
+        return "txt"
+
+
 # ------------------ Hlavní aplikace ------------------
 class ScanApp(QWidget):
     def __init__(self) -> None:
@@ -154,6 +269,7 @@ class ScanApp(QWidget):
         self._ocr_mode = "interactive"
         self._last_text = ""
         self._last_original_text = ""
+        self._last_edited_pages: list[str] | None = None
         self._diacritics_failed = False
         self._diacritics_enabled_cache = False
         self._ocr_total_pages: int = 0
@@ -588,6 +704,7 @@ class ScanApp(QWidget):
             self.last_ocr_results.clear()
             self._last_text = ""
             self._last_original_text = ""
+            self._last_edited_pages = None
             self._diacritics_failed = False
             self.btn_ocr.setEnabled(False)
             self.btn_read.setEnabled(False)
@@ -596,6 +713,7 @@ class ScanApp(QWidget):
             self.last_ocr_results.clear()
             self._last_text = ""
             self._last_original_text = ""
+            self._last_edited_pages = None
             self._diacritics_failed = False
 
         speak("Zahajuji skenování.")
@@ -780,6 +898,15 @@ class ScanApp(QWidget):
         del self.raw_scanned_images[row]
         if self.last_ocr_results and row < len(self.last_ocr_results):
             del self.last_ocr_results[row]
+        if self._last_edited_pages is not None and row < len(self._last_edited_pages):
+            del self._last_edited_pages[row]
+        # Pokud byl _last_text s headery, přegeneruj ho podle zbývajících stránek
+        if self._last_edited_pages is not None:
+            # Přegeneruj _last_text aby reflektoval smazání stránky
+            parts = []
+            for idx, p in enumerate(self._last_edited_pages):
+                parts.append(f"--- Stránka {idx+1} ---\n{p}\n\n")
+            self._last_text = "".join(parts)
         # Renumber remaining items to keep Stránka 1..N consistent
         self._renumber_pages()
         remaining = len(self.scanned_images)
@@ -788,6 +915,7 @@ class ScanApp(QWidget):
             self.btn_read.setEnabled(False)
             self._last_text = ""
             self._last_original_text = ""
+            self._last_edited_pages = None
             self._diacritics_failed = False
             speak("Všechny stránky smazány.")
             self.btn_scan.setFocus()
@@ -824,6 +952,7 @@ class ScanApp(QWidget):
         self.last_ocr_results.clear()
         self._last_text = ""
         self._last_original_text = ""
+        self._last_edited_pages = None
         self._diacritics_failed = False
         self.btn_ocr.setEnabled(False)
         self.btn_read.setEnabled(False)
@@ -907,6 +1036,15 @@ class ScanApp(QWidget):
             self._last_text = old_text.rstrip() + "\n\n" + corrected_new_text
         else:
             self._last_text = corrected_new_text
+        # Aktualizuj per-page
+        try:
+            pages = _split_text_by_page_headers(self._last_text)
+            if pages is not None and len(pages) == len(self.last_ocr_results):
+                self._last_edited_pages = pages
+            else:
+                self._last_edited_pages = None
+        except Exception:
+            self._last_edited_pages = None
         # Rekonstrukce originálu
         try:
             orig_parts = []
@@ -1101,6 +1239,15 @@ class ScanApp(QWidget):
     def _ocr_finished(self, full_text: str) -> None:
         self.progress_dialog.cancel()
         self._last_text = full_text
+        # Inicializuj per-page z full_text
+        try:
+            pages = _split_text_by_page_headers(full_text)
+            if pages is not None and len(pages) == len(self.scanned_images):
+                self._last_edited_pages = pages
+            else:
+                self._last_edited_pages = None
+        except Exception:
+            self._last_edited_pages = None
         # Rekonstrukce originálu z OcrResult.original_text pro zachování původního výsledku
         try:
             orig_parts = []
@@ -1136,29 +1283,100 @@ class ScanApp(QWidget):
         speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit, přečíst nebo uložit.")
         dialog = OcrPreviewDialog(full_text, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            # Zrušení náhledu – zachovat OCR výsledky a stránky, vrátit fokus
+            self.btn_read.setFocus()
             return
         edited_text = dialog.get_text()
         self._last_text = edited_text
+        # Aktualizuj per-page podle editace
+        try:
+            pages = _split_text_by_page_headers(edited_text)
+            if pages is not None:
+                self._last_edited_pages = pages
+            else:
+                # Bez headerů nelze rekonstruovat per-page z edited textu,
+                # ponech původní per-page z full_text/OCR pokud existují
+                # Ale pokud jedna stránka a žádný header, považuj celý text za stránku 1
+                if len(self.scanned_images) == 1:
+                    self._last_edited_pages = [edited_text]
+                else:
+                    # Pro více stran bez headerů – neumíme bezpečně rozdělit, ponech None
+                    # DOCX/TXT fallback použije OCR per-page nebo celý text
+                    self._last_edited_pages = None
+        except Exception:
+            self._last_edited_pages = None
+
+        # Samostatná akce "Uložit dokument" – nejprve výběr formátu
+        speak("Zvolte formát dokumentu k uložení.")
+        fmt_dialog = SaveDocumentDialog(self)
+        if fmt_dialog.exec() != QDialog.DialogCode.Accepted:
+            self.btn_read.setFocus()
+            return
+        fmt = fmt_dialog.selected_format()
+
+        # Výchozí název a filtry podle zvoleného formátu
+        filters = {
+            "txt": "Textový dokument (*.txt)",
+            "docx": "Word dokument (*.docx)",
+            "pdf": "PDF s OCR (*.pdf)",
+        }
+        suffixes = {"txt": ".txt", "docx": ".docx", "pdf": ".pdf"}
+        chosen_filter = filters[fmt]
+        suffix = suffixes[fmt]
+        # Výchozí cesta – Dokumenty nebo home
+        default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        if not default_dir:
+            default_dir = os.path.expanduser("~")
+        default_path = os.path.join(default_dir, "naskenovany_dokument" + suffix)
 
         speak("Vyberte umístění pro uložení souboru.")
-        path, selected_filter = QFileDialog.getSaveFileName(
-            self, "Uložit", "",
-            "Text (*.txt);;PDF (*.pdf);;Word (*.docx)"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Uložit dokument", default_path, chosen_filter
         )
         if not path:
             self.btn_read.setFocus()
             return
+        # Zajistit správnou příponu podle zvoleného formátu
+        if not path.lower().endswith(suffix):
+            # Pokud uživatel zadal jinou příponu, respektuj zvolený formát
+            # (odstraň případnou jinou příponu a přidej správnou)
+            base, ext = os.path.splitext(path)
+            if ext.lower() not in (".txt", ".pdf", ".docx"):
+                path = path + suffix
+            else:
+                # Má jinou známou příponu – nahraď podle formátu
+                if ext.lower() != suffix:
+                    path = base + suffix
+        # Ochrana proti přepsání – QFileDialog již dotazuje nativně, ale pro jistotu
+        # pokud DontConfirmOverwrite není a cesta existuje, Qt již potvrdilo.
+        # Pro ne-nativní fallback ještě ověřit:
+        if os.path.exists(path):
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Soubor již existuje")
+            msg.setText(f"Soubor již existuje:\n{path}")
+            msg.setInformativeText("Chcete jej přepsat?")
+            btn_over = msg.addButton("Přepsat", QMessageBox.ButtonRole.YesRole)
+            btn_over.setAccessibleName("Ano, přepsat soubor")
+            btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.NoRole)
+            btn_cancel.setAccessibleName("Zrušit, neukládat")
+            msg.setDefaultButton(btn_cancel)
+            msg.exec()
+            if msg.clickedButton() != btn_over:
+                speak("Ukládání zrušeno, soubor nebyl přepsán.")
+                self.btn_read.setFocus()
+                return
 
-        if path.lower().endswith(".pdf"):
-            self._save_pdf(path)
-        elif path.lower().endswith(".docx"):
-            self._save_docx(edited_text, path)
-        else:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(edited_text)
-            QMessageBox.information(self, "Hotovo", "Text uložen.")
-            speak("Soubor byl úspěšně uložen.")
-            self.btn_scan.setFocus()
+        try:
+            if fmt == "pdf":
+                self._save_pdf(path)
+            elif fmt == "docx":
+                self._save_docx_pages(path)
+            else:
+                self._save_txt_pages(path, edited_text)
+        except Exception as e:
+            QMessageBox.critical(self, "Chyba při ukládání", f"Nepodařilo se uložit soubor:\n{e}")
+            speak("Chyba při ukládání souboru.")
+            self.btn_read.setFocus()
 
     def read_last_text(self) -> None:
         # Při zapnuté opravě čte processed_text (už v _last_text), jinak originál
@@ -1214,6 +1432,108 @@ class ScanApp(QWidget):
         speak("Obrázky exportovány.")
 
     # ---------- Save helpers ----------
+    def _get_docx_pages(self) -> list[str]:
+        """Vrátí list textů per-page pro DOCX podle skutečných stránek.
+
+        Priorita:
+        1) _last_edited_pages pokud délka == scanned_images
+        2) rekonstrukce z last_ocr_results (display_text)
+        3) fallback rozdělení _last_text
+        """
+        total = len(self.scanned_images)
+        # 1) upravené stránky pokud sedí počet
+        if self._last_edited_pages is not None and len(self._last_edited_pages) == total:
+            return list(self._last_edited_pages)
+        # Zkusit re-split _last_text pokud obsahuje headery a sedí
+        if self._last_text:
+            pages = _split_text_by_page_headers(self._last_text)
+            if pages is not None and len(pages) == total:
+                return pages
+        # 2) rekonstrukce z OCR výsledků
+        if self.last_ocr_results and len(self.last_ocr_results) == total:
+            out: list[str] = []
+            for page in self.last_ocr_results:
+                if not page:
+                    out.append("")
+                else:
+                    # Spoj display_text jednotlivých OcrResult s novým řádkem
+                    # (zachová odřádkování, ne přidává umělé \n\n mezi každým slovem)
+                    texts = [r.display_text for r in page]
+                    # Pokud je více výsledků, spoj je novým řádkem – DOCX pak splitne \n\n na odstavce
+                    out.append("\n".join(texts) if len(texts) > 1 else (texts[0] if texts else ""))
+            return out
+        # 3) fallback – rozděl _last_text i když nesedí, nebo vrať jako jednu stránku
+        if self._last_text:
+            pages = _split_text_by_page_headers(self._last_text)
+            if pages is not None:
+                # Doplň/zkrát na total
+                if len(pages) < total:
+                    pages = pages + [""] * (total - len(pages))
+                return pages[:total]
+            return [self._last_text]
+        return [""] * total if total else []
+
+    def _save_txt_pages(self, path: str, edited_text: str) -> None:
+        """Uloží TXT s oddělovači --- Stránka N --- v pořadí 1..N, čitelné pro NVDA."""
+        total = len(self.scanned_images)
+        # Pokud edited_text již obsahuje headery a počet sedí nebo je alespoň 1, ulož přímo
+        pages = _split_text_by_page_headers(edited_text)
+        if pages is not None and len(pages) == total:
+            # Obsah již má správné headery – ulož edited_text přímo (zachová přesnou editaci)
+            # Ale normalizuj aby každý header byl přesně "--- Stránka N ---"
+            # Pro jednoduchost ulož přímo edited_text pokud obsahuje headery
+            content = edited_text
+            # Zajisti, že soubor končí newline
+            if not content.endswith("\n"):
+                content += "\n"
+        elif total > 0:
+            # Generuj per-page z edited_text per-page pokud sedí, jinak fallback na edited split nebo OCR
+            if pages is not None and len(pages) == total:
+                content = ""
+                for i, p in enumerate(pages):
+                    content += f"--- Stránka {i+1} ---\n{p}\n\n"
+            elif self._last_edited_pages is not None and len(self._last_edited_pages) == total:
+                content = ""
+                for i, p in enumerate(self._last_edited_pages):
+                    content += f"--- Stránka {i+1} ---\n{p}\n\n"
+            else:
+                # Pokud edited_text nemá headery ale máme total, zkusit rozdělitEdited nebo použít celý edited_text jako stránku 1 + prázdné?
+                # Nejbezpečnější: pokud edited_text neobsahuje headery a je jen jeden dokument,
+                # ulož ho jako souvislý text s headery podle skutečných stránek.
+                # Pokud edited_text obsahuje více odstavců ale bez headerů, nelze bezpečně rekonstruovat per-page,
+                # takže pokud total==1 ulož přímo, jinak vygeneruj z OCR nebo z edited_text jako celek pro stránku 1.
+                if total == 1:
+                    # Pokud jedna stránka, bez headeru je ok, ale pro konzistenci přidej header
+                    # Pokud uživatel explicitně smazal header, respektuj jeho editaci – ulož bez headeru
+                    # Detekce: pokud edited_text nemá header a total==1, ulož edited_text přímo
+                    content = edited_text
+                else:
+                    # Více stránek ale text bez headerů – pokus se generovat z OCR per-page pokud dostupné
+                    if self.last_ocr_results and len(self.last_ocr_results) == total:
+                        # Pokud je edited_text výrazně odlišný od OCR, může být uživatelská editace
+                        # – v tom případě bez spolehlivého per-page rozdělení je bezpečnější uložit
+                        # edited_text jako celek bez umělého dělení.
+                        # Preferuj edited_text jako celek pro TXT čitelnost, ale zachovej informaci o stránkách:
+                        # Zkusíme: pokud edited_text obsahuje "\n\n" ale ne headery, uložíme ho s headery pouze pro první stránku?
+                        # Ne – specifikace říká TXT může obsahovat souvislý text všech stránek s oddělovači.
+                        # Pokud nemáme per-page, použij OCR per-page jako zdroj a ignoruj edited? To by zahodilo editaci.
+                        # Proto: ulož edited_text jako souvislý text s fallback generováním oddělovačů jen pokud edited_text je per-page.
+                        # Aktuálně: edited_text bez headerů pro více stran → ulož edited_text přímo (bez umělého dělení) + přidej info?
+                        # Rozhodnutí: ulož edited_text přímo, protože umělé dělení by bylo nebezpečné.
+                        # Ale pro konzistenci a NVDA čitelnost je lepší mít headery. Pokud edited_text nemá headery,
+                        # vytvoř per-page z OCR a nepoužívej edited – dokument by ztratil editaci. To je horší.
+                        # Kompromis: pokud edited_text bez headerů a total>1, ulož s headery kde stránka 1 = edited_text, ostatní prázdné?
+                        # Ne, to je matoucí. Nejmenší překvapení: ulož edited_text přímo.
+                        content = edited_text
+                    else:
+                        content = edited_text
+        else:
+            content = edited_text
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self._show_save_success(path, "Textový dokument (.txt)", "Textový dokument")
+
     def _save_pdf(self, path: str) -> None:
         doc = fitz.open()
         dpi = self.dpi_combo.currentData()
@@ -1254,18 +1574,47 @@ class ScanApp(QWidget):
                         pass
 
         doc.save(path)
-        QMessageBox.information(self, "Hotovo", "PDF uloženo.")
-        speak("PDF soubor uložen.")
-        self.btn_scan.setFocus()
+        self._show_save_success(path, "PDF s OCR (.pdf)", "PDF")
 
     def _save_docx(self, text: str, path: str) -> None:
+        """Legacy wrapper – zachován pro kompatibilitu (makra). Nově volá per-page logiku."""
+        # Aktualizuj _last_text a _last_edited_pages pro per-page logiku
+        self._last_text = text
+        pages = _split_text_by_page_headers(text)
+        if pages is not None:
+            self._last_edited_pages = pages
+        self._save_docx_pages(path)
+
+    def _save_docx_pages(self, path: str) -> None:
+        """Uloží DOCX rozdělený podle skutečných naskenovaných stránek (page break pouze mezi stránkami)."""
         doc = Document()
-        for part in text.split("\n\n"):
-            doc.add_paragraph(part)
-            doc.add_page_break()
+        pages = self._get_docx_pages()
+        total = len(pages)
+        for idx, page_text in enumerate(pages):
+            # Rozděl na odstavce podle dvojitého odřádkování, ale bez přidávání page break mezi odstavci
+            if page_text is None:
+                page_text = ""
+            # Zachovej prázdné stránky
+            if not page_text.strip():
+                doc.add_paragraph("")
+            else:
+                paragraphs = page_text.split("\n\n")
+                for para in paragraphs:
+                    # Prázdné odstavce zachovej jako prázdný paragraph
+                    doc.add_paragraph(para)
+            if idx < total - 1:
+                doc.add_page_break()
         doc.save(path)
-        QMessageBox.information(self, "Hotovo", "DOCX uloženo.")
-        speak("Soubor uložen.")
+        self._show_save_success(path, "Word dokument (.docx)", "Word dokument")
+
+    def _show_save_success(self, path: str, format_human: str, format_short: str) -> None:
+        """Společný úspěšný dialog – přístupný, s cestou v textu, krátkou hlasovou hláškou."""
+        QMessageBox.information(
+            self, "Hotovo",
+            f"Dokument byl úspěšně uložen.\nFormát: {format_human}\nCesta: {path}"
+        )
+        # Hlasově krátce, bez celé cesty
+        speak(f"Dokument byl úspěšně uložen. Dokument byl uložen jako {format_short}.")
         self.btn_scan.setFocus()
 
     # ---------- Macros ----------
