@@ -37,6 +37,8 @@ from ocr_engine import (
 )
 from macro import Macro, MacroManager, PipelineRunner
 from macro_editor import MacroEditorDialog
+import pdf_import
+from pdf_import import PdfImportWorker
 
 import logging
 logger = logging.getLogger(__name__)
@@ -670,6 +672,130 @@ class ChooseOcrFormatDialog(QDialog):
         return "txt"
 
 
+# ------------------ Dialogy pro import PDF ------------------
+class PdfImportSummaryDialog(QDialog):
+    """Souhrn analýzy importovaných PDF – přístupný, NVDA-first.
+
+    Zobrazí per-file výsledek (počet stran, strany potřebující OCR).
+    Tlačítka: Pokračovat k OCR / Zrušit.
+    """
+
+    def __init__(self, summary_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Import PDF – souhrn analýzy")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        lbl = QLabel(summary_text)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lbl.setAccessibleName("Souhrn analýzy PDF")
+        lbl.setAccessibleDescription(summary_text)
+        layout.addWidget(lbl)
+        self._summary_text = summary_text
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        btn_ok.setText("Pokračovat k OCR")
+        btn_ok.setAccessibleName("Pokračovat k OCR")
+        btn_ok.setAccessibleDescription(
+            "Pokračuje k výběru OCR enginu a jazyka. OCR proběhne pouze na stránkách bez textu.")
+        btn_ok.setDefault(True)
+        btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
+        btn_cancel.setText("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit import")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        self._btn_ok = btn_ok
+        self.setTabOrder(btn_ok, btn_cancel)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._btn_ok.setFocus(Qt.FocusReason.OtherFocusReason)
+        speak("Souhrn analýzy PDF. " + self._summary_text)
+
+
+class ImportOcrSettingsDialog(QDialog):
+    """OCR nastavení pro import – engine + jazyk.
+
+    Výchozí hodnoty přebírá z hlavní aplikace (engine_combo / lang_combo),
+    po potvrzení je volající propíše zpět – žádný druhý systém nastavení.
+    """
+
+    LANG_ITEMS = [
+        "ces (Čeština)", "eng (Angličtina)", "deu (Němčina)",
+        "fra (Francouzština)", "ita (Italština)", "pol (Polština)",
+    ]
+
+    def __init__(self, engine_default: str, lang_index_default: int,
+                 info_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("OCR nastavení pro import")
+        self.setMinimumWidth(480)
+        layout = QVBoxLayout(self)
+
+        lbl_info = QLabel(info_text)
+        lbl_info.setWordWrap(True)
+        lbl_info.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lbl_info.setAccessibleName("Informace o rozsahu OCR")
+        layout.addWidget(lbl_info)
+
+        lbl_engine = QLabel("OCR engine:")
+        self.engine_combo = QComboBox()
+        self.engine_combo.setAccessibleName("OCR engine pro import")
+        self.engine_combo.setAccessibleDescription("Vyberte Tesseract nebo EasyOCR pro rozpoznání stránek bez textu.")
+        self.engine_combo.addItems(["Tesseract", "EasyOCR"])
+        idx = self.engine_combo.findText(engine_default)
+        if idx >= 0:
+            self.engine_combo.setCurrentIndex(idx)
+        lbl_engine.setBuddy(self.engine_combo)
+        layout.addWidget(lbl_engine)
+        layout.addWidget(self.engine_combo)
+
+        lbl_lang = QLabel("Jazyk OCR:")
+        self.lang_combo = QComboBox()
+        self.lang_combo.setAccessibleName("Jazyk OCR pro import")
+        self.lang_combo.setAccessibleDescription("Vyberte jazyk dokumentu pro rozpoznání textu.")
+        self.lang_combo.addItems(list(self.LANG_ITEMS))
+        if 0 <= lang_index_default < self.lang_combo.count():
+            self.lang_combo.setCurrentIndex(lang_index_default)
+        lbl_lang.setBuddy(self.lang_combo)
+        layout.addWidget(lbl_lang)
+        layout.addWidget(self.lang_combo)
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
+        btn_ok.setText("Spustit OCR")
+        btn_ok.setAccessibleName("Spustit OCR importovaných PDF")
+        btn_ok.setDefault(True)
+        btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
+        btn_cancel.setText("Zrušit")
+        btn_cancel.setAccessibleName("Zrušit import")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        self.setTabOrder(self.engine_combo, self.lang_combo)
+        self.setTabOrder(self.lang_combo, btn_ok)
+        self.setTabOrder(btn_ok, btn_cancel)
+        self._btn_ok = btn_ok
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.engine_combo.setFocus(Qt.FocusReason.OtherFocusReason)
+        speak("Dialog OCR nastavení pro import. Vyberte engine a jazyk a potvrďte Spustit OCR.")
+
+    def selected_engine(self) -> str:
+        return self.engine_combo.currentText()
+
+    def selected_lang_index(self) -> int:
+        return self.lang_combo.currentIndex()
+
+    def selected_lang_text(self) -> str:
+        return self.lang_combo.currentText()
+
+
 # ------------------ Hlavní aplikace ------------------
 class ScanApp(QWidget):
     def __init__(self) -> None:
@@ -908,6 +1034,15 @@ class ScanApp(QWidget):
         btn_export_img.clicked.connect(self.export_images)
         layout.addWidget(btn_export_img)
 
+        self.btn_import_pdf = QPushButton("Importovat PDF (Ctrl+I)")
+        self.btn_import_pdf.setAccessibleName("Importovat PDF")
+        self.btn_import_pdf.setAccessibleDescription(
+            "Vybere jeden nebo více PDF souborů, zjistí které stránky potřebují OCR "
+            "a vytvoří nové prohledávatelné PDF. Původní soubor zůstane zachován."
+        )
+        self.btn_import_pdf.clicked.connect(self.import_pdfs)
+        layout.addWidget(self.btn_import_pdf)
+
         # -- Uživatelská makra --
         macro_group = QGroupBox("Uživatelská makra")
         self._macro_container = QVBoxLayout()
@@ -972,6 +1107,7 @@ class ScanApp(QWidget):
         self.setTabOrder(self.btn_ocr, self.btn_save_document)
         self.setTabOrder(self.btn_save_document, self.btn_read)
         self.setTabOrder(self.btn_read, btn_export_img)
+        self.setTabOrder(btn_export_img, self.btn_import_pdf)
 
         # Uložit reference pro testování Tab order a pro focus handling
         self._scroll_area = scroll
@@ -1041,6 +1177,7 @@ class ScanApp(QWidget):
         QShortcut(QKeySequence("Ctrl+U"), self).activated.connect(self.save_document)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.read_last_text)
         QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self.export_images)
+        QShortcut(QKeySequence("Ctrl+I"), self).activated.connect(self.import_pdfs)
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.close)
         QShortcut(QKeySequence("Delete"), self).activated.connect(self.delete_page)
         QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self._open_macro_editor)
@@ -2548,6 +2685,191 @@ class ScanApp(QWidget):
             f"{len(self.scanned_images)} obrázků uloženo do {dir_path}"
         )
         speak("Obrázky exportovány.")
+
+    # ---------- Import PDF se selektivním OCR ----------
+    def import_pdfs(self) -> None:
+        """GUI workflow importu PDF. Tezka prace bezi ve workeru, dialogy
+        a speak() pouze zde v GUI vlakne."""
+        default_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        if not default_dir:
+            default_dir = os.path.expanduser("~")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Importovat PDF", default_dir, "PDF (*.pdf)")
+        if not paths:
+            return
+        if len(paths) == 1:
+            speak("Byl vybrán 1 PDF soubor.")
+        elif 2 <= len(paths) <= 4:
+            speak(f"Byly vybrány {len(paths)} PDF soubory.")
+        else:
+            speak(f"Bylo vybráno {len(paths)} PDF souborů.")
+
+        # Rychla analyza (cista textova extrakce, ms) - souhrn pro dialog.
+        analyses = [pdf_import.analyze_pdf(p) for p in paths]
+        summary = "\n\n".join(pdf_import.format_analysis_summary(a) for a in analyses)
+        need_total = sum(len(a.pages_needing_ocr) for a in analyses if a.ok)
+
+        if need_total == 0:
+            speak("Všechny vybrané dokumenty již obsahují použitelný text. OCR není potřeba.")
+            QMessageBox.information(
+                self, "Import PDF",
+                summary + "\n\nVšechny vybrané dokumenty již obsahují použitelný text. OCR není potřeba.")
+            self.btn_import_pdf.setFocus()
+            return
+
+        speak(summary)
+        if PdfImportSummaryDialog(summary, self).exec() != QDialog.DialogCode.Accepted:
+            speak("Import zrušen.")
+            self.btn_import_pdf.setFocus()
+            return
+
+        info = (f"OCR proběhne pouze na {need_total} "
+                f"stránkách bez použitelného textu. Původní soubory zůstanou zachovány.")
+        settings_dlg = ImportOcrSettingsDialog(
+            self.engine_combo.currentText(), self.lang_combo.currentIndex(), info, self)
+        if settings_dlg.exec() != QDialog.DialogCode.Accepted:
+            speak("Import zrušen.")
+            self.btn_import_pdf.setFocus()
+            return
+
+        # Propsat volbu zpet do stavajiciho systemu nastaveni (zadny druhy system).
+        engine = settings_dlg.selected_engine()
+        lang_idx = settings_dlg.selected_lang_index()
+        eng_idx = self.engine_combo.findText(engine)
+        if eng_idx >= 0:
+            self.engine_combo.setCurrentIndex(eng_idx)
+        if 0 <= lang_idx < self.lang_combo.count():
+            self.lang_combo.setCurrentIndex(lang_idx)
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        lang_raw = self.lang_combo.currentText()
+        diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
+
+        # Predbezna kontrola konfliktu nazvu - VZDY v GUI vlakne.
+        overwrite_allowed: dict[str, bool] = {}
+        for analysis in analyses:
+            if not analysis.ok or not analysis.pages_needing_ocr:
+                continue
+            out = pdf_import.default_output_path(analysis.path)
+            if os.path.exists(out):
+                if self._confirm_overwrite(out):
+                    overwrite_allowed[out] = True
+                else:
+                    overwrite_allowed[out] = False
+        jobs, skipped = pdf_import.build_jobs(
+            analyses, engine, lang_raw, diac_enabled, overwrite_allowed)
+        if not jobs:
+            speak("Žádný soubor k zpracování. Import ukončen.")
+            detail = "\n".join(s.message for s in skipped) or "Ukládání bylo zrušeno."
+            QMessageBox.information(self, "Import PDF",
+                                    f"Žádný soubor k zpracování.\n{detail}")
+            self.btn_import_pdf.setFocus()
+            return
+
+        self._run_pdf_import_jobs(jobs, skipped)
+
+    def _run_pdf_import_jobs(self, jobs: list, skipped: list) -> None:
+        """Spusti davkovy worker a po dokonceni zobrazi pristupny souhrn."""
+        self._pdf_import_job_info: dict[str, tuple[int, int, int]] = {}
+        for i, job in enumerate(jobs):
+            self._pdf_import_job_info[job.src_path] = (i + 1, len(jobs), len(job.pages_to_ocr))
+        total_units = sum(len(j.pages_to_ocr) for j in jobs) or 1
+
+        self._pdf_import_worker = PdfImportWorker(jobs)
+        self._pdf_import_results: list = []
+        progress = QProgressDialog("Zahajuji import PDF...", "Zrušit", 0, total_units, self)
+        progress.setWindowTitle("Import PDF")
+        progress.setAccessibleName("Průběh importu PDF")
+        self._pdf_import_progress = progress
+        worker = self._pdf_import_worker
+        worker.job_started.connect(self._on_pdf_import_job_started)
+        worker.job_message.connect(self._on_pdf_import_job_message)
+        worker.overall_progress.connect(self._on_pdf_import_overall)
+        worker.batch_finished.connect(self._on_pdf_import_batch_finished)
+
+        loop = QEventLoop()
+        worker.batch_finished.connect(loop.quit)
+        progress.canceled.connect(self._cancel_pdf_import)
+        worker.start()
+        progress.show()
+        loop.exec()
+        try:
+            progress.cancel()
+        except Exception:
+            pass
+
+        results = list(self._pdf_import_results) + list(skipped)
+        ok = [r for r in results if r.status == "ok"]
+        failed = [r for r in results if r.status == "failed"]
+        cancelled = [r for r in results if r.status == "cancelled"]
+        skipped_only = [r for r in results if r.status == "skipped"]
+
+        lines = [f"Import dokončen: úspěšně {len(ok)}, "
+                 f"přeskočeno {len(skipped_only)}, "
+                 f"selhalo {len(failed)}, zrušeno {len(cancelled)}."]
+        for r in ok:
+            lines.append(f"OK: {os.path.basename(r.src_path)} → {os.path.basename(r.out_path)}")
+        for r in failed:
+            lines.append(f"Selhalo: {os.path.basename(r.src_path)} – {r.message}")
+        for r in skipped_only:
+            lines.append(f"Přeskočeno: {os.path.basename(r.src_path)} – {r.message}")
+        text = "\n".join(lines)
+        if failed or cancelled:
+            QMessageBox.warning(self, "Import PDF", text)
+        else:
+            QMessageBox.information(self, "Import PDF", text)
+        if ok and not failed and not cancelled:
+            speak(f"OCR dokončeno. Zpracováno {len(ok)} dokumentů.")
+        else:
+            speak(f"Import dokončen. Úspěšně {len(ok)}, selhalo {len(failed)}, "
+                  f"přeskočeno {len(skipped_only)}, zrušeno {len(cancelled)}.")
+        self.btn_import_pdf.setFocus()
+        self._pdf_import_worker = None
+
+    def _update_pdf_import_label(self, text: str) -> None:
+        try:
+            if getattr(self, "_pdf_import_progress", None) is not None:
+                self._pdf_import_progress.setLabelText(text)
+        except Exception:
+            pass
+
+    def _on_pdf_import_job_started(self, src_path: str, idx: int, total: int) -> None:
+        base = os.path.basename(src_path)
+        info = getattr(self, "_pdf_import_job_info", {}).get(src_path)
+        n = f", celkem {info[2]} stran k OCR" if info else ""
+        self._update_pdf_import_label(f"Zpracovávám soubor {idx} ze {total}: {base}{n}.")
+        speak(f"Zpracovávám soubor {idx} ze {total}: {base}.")
+
+    def _on_pdf_import_job_message(self, src_path: str, text: str) -> None:
+        base = os.path.basename(src_path)
+        info = getattr(self, "_pdf_import_job_info", {}).get(src_path)
+        if info is not None:
+            idx, total, _n = info
+            self._update_pdf_import_label(
+                f"Zpracovávám soubor {idx} ze {total}: {base}, {text}.")
+        else:
+            self._update_pdf_import_label(f"{base}: {text}.")
+
+    def _on_pdf_import_overall(self, done: int, total: int) -> None:
+        try:
+            if getattr(self, "_pdf_import_progress", None) is not None:
+                self._pdf_import_progress.setMaximum(max(int(total), 1))
+                self._pdf_import_progress.setValue(int(done))
+        except Exception:
+            pass
+
+    def _on_pdf_import_batch_finished(self, results: list) -> None:
+        self._pdf_import_results = list(results)
+
+    def _cancel_pdf_import(self) -> None:
+        speak("Ruším import PDF.")
+        try:
+            if getattr(self, "_pdf_import_worker", None) is not None:
+                self._pdf_import_worker.requestInterruption()
+        except Exception:
+            pass
 
     # ---------- Save helpers ----------
     def _get_docx_pages(self) -> list[str]:
