@@ -252,12 +252,12 @@ def test_tesseract_sync_branch(monkeypatch):
     assert pages[0][0].bbox[0][0] == pytest.approx(10.0)
 
 
-# 7 - EasyOCR sync vetev (mock Reader)
+# 7 - EasyOCR sync vetev (mock Reader, skutecny paragraph=True format [bbox, text])
 def test_easyocr_sync_branch(monkeypatch):
     class FakeReader:
         def readtext(self, arr, paragraph=True):
             assert paragraph is True
-            return [([ [1.0, 2.0], [11.0, 2.0], [11.0, 12.0], [1.0, 12.0] ], "Easy text", 0.9)]
+            return [[[[1.0, 2.0], [11.0, 2.0], [11.0, 12.0], [1.0, 12.0]], "Easy text"]]
     monkeypatch.setattr(pdf_import, "ensure_easyocr_reader", lambda lang: FakeReader())
     img = Image.new("RGB", (400, 200), "white")
     pages = pdf_import.easyocr_ocr_images_sync([img], "ces (Čeština)")
@@ -467,3 +467,364 @@ def test_worker_sequential_batch(tmp_path, monkeypatch):
     assert finished[0].status == "failed"
     assert finished[1].status == "ok"
     assert len(collected) == 2
+
+
+# =====================================================================
+# Nova matice: prazdne OCR vs page-level fallback vs word-level (pozadavky 1-5)
+# =====================================================================
+
+FALLBACK_CZ = "Příliš žluťoučký kůň úpěl"
+
+
+def _mock_tesseract_pair(monkeypatch, data, text):
+    import pytesseract
+    monkeypatch.setattr(pytesseract, "image_to_data", lambda *a, **k: data)
+    monkeypatch.setattr(pytesseract, "image_to_string", lambda *a, **k: text)
+
+
+def _make_degenerate_pdf(path):
+    """Stara vadna vrstva: obrazek + text s fontsize=0 (dostatecna delka,
+    ale bez geometrie slov). Stage C - suspicious-layer."""
+    import io as _io
+    doc = fitz.open()
+    img = Image.new("RGB", (1200, 1600), "white")
+    d = ImageDraw.Draw(img)
+    d.text((100, 100), "sken pod vadnou vrstvou", fill="black")
+    buf = _io.BytesIO()
+    img.save(buf, "PNG")
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    page.insert_text((72, 72), "degenerovana stara vrstva historicke ocr " * 5,
+                     fontsize=0)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+# Test 1: data prazdne + string prazdny -> skutecny OCR failure
+def test_tesseract_empty_data_empty_string_is_failure(tmp_path, monkeypatch):
+    data = {"text": ["", " "], "conf": ["-1", "0"],
+            "left": [0, 0], "top": [0, 0], "width": [0, 0], "height": [0, 0]}
+    _mock_tesseract_pair(monkeypatch, data, "")
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.tesseract_ocr_images_sync([img], "ces (Čeština)")
+    assert pages == [[]]
+    src = str(tmp_path / "sken.pdf")
+    _make_image_pdf(src, pages=1)
+    out = default_output_path(src)
+    res = process_single_job(ImportJob(src_path=src, out_path=out, pages_to_ocr=[1]))
+    # process_single_job pouziva realny ocr_images_sync -> prepatchuj i ten
+    # pres tesseract mock vyse: tesseract_ocr_images_sync vrati [[]]
+    assert res.status == "failed"
+    assert "nerozpoznal" in res.message
+    assert not os.path.exists(out)
+
+
+# Test 2: data prazdne + string "Příliš žluťoučký kůň" -> page-level fallback
+def test_tesseract_empty_data_with_string_page_fallback(tmp_path, monkeypatch):
+    data = {"text": ["", " "], "conf": ["-1", "0"],
+            "left": [0, 0], "top": [0, 0], "width": [0, 0], "height": [0, 0]}
+    _mock_tesseract_pair(monkeypatch, data, FALLBACK_CZ)
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.tesseract_ocr_images_sync([img], "ces (Čeština)")
+    assert len(pages) == 1 and len(pages[0]) == 1
+    assert pages[0][0].bbox is None
+    assert FALLBACK_CZ in pages[0][0].text
+    assert pages[0][0].original_text.strip() != ""
+    assert pages[0][0].processed_text == pages[0][0].text
+    src = str(tmp_path / "sken.pdf")
+    _make_image_pdf(src, pages=1)
+    out = default_output_path(src)
+    res = process_single_job(ImportJob(src_path=src, out_path=out, pages_to_ocr=[1]))
+    assert res.status == "ok", res.message
+    texts, _ = _page_texts(out)
+    assert FALLBACK_CZ in texts[0]
+
+
+# Test 2b: diakritika plati i pro fallback text
+def test_tesseract_fallback_diacritics_applied(monkeypatch):
+    import diacritics as _dia
+    data = {"text": [""], "conf": ["-1"],
+            "left": [0], "top": [0], "width": [0], "height": [0]}
+
+    class FakeDiac:
+        def diacritize(self, s):
+            return s + "-DIA"
+
+    monkeypatch.setattr(_dia, "should_diacritize", lambda lang, en: True)
+    monkeypatch.setattr(_dia, "get_diacritizer", lambda: FakeDiac())
+    _mock_tesseract_pair(monkeypatch, data, "fallback text")
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.tesseract_ocr_images_sync([img], "ces (Čeština)",
+                                                 diacritics_enabled=True)
+    assert pages[0][0].text.endswith("-DIA")
+    assert pages[0][0].processed_text.endswith("-DIA")
+    assert pages[0][0].original_text == "fallback text"
+
+
+# Test 3: normalni bbox + normalni text -> word-level, zadny zbytecny fallback
+def test_tesseract_wordlevel_no_spurious_fallback(monkeypatch):
+    data = {"text": ["Hello", "world"], "conf": ["90", "85"],
+            "left": [10, 120], "top": [20, 20], "width": [100, 100], "height": [30, 30]}
+    _mock_tesseract_pair(monkeypatch, data, "Hello world")
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.tesseract_ocr_images_sync([img], "ces (Čeština)")
+    assert len(pages[0]) == 2
+    assert all(r.bbox is not None for r in pages[0])
+
+
+# Test 4: degenerovana vrstva nesmi byt oznacena jako kvalitne searchable
+def test_degenerate_layer_classified_suspicious(tmp_path):
+    src = str(tmp_path / "stare.pdf")
+    _make_degenerate_pdf(src)
+    analysis = analyze_pdf(src)
+    assert analysis.ok
+    assert analysis.pages_needing_ocr == [1]
+    assert analysis.pages[0].suspicious is True
+    assert analysis.pages[0].reason.startswith("suspicious-layer")
+    assert "podezřelá" in format_analysis_summary(analysis)
+    # zdrava textova strana zustava searchable
+    good = str(tmp_path / "zdrave.pdf")
+    _make_text_pdf(good, pages=1)
+    ga = analyze_pdf(good)
+    assert ga.pages_needing_ocr == []
+    assert ga.pages[0].suspicious is False
+
+
+# Strip + nova vrstva: zadna duplicita stara+nova
+def test_suspicious_strip_replaces_not_duplicates(tmp_path, monkeypatch):
+    src = str(tmp_path / "stare.pdf")
+    _make_degenerate_pdf(src)
+    before_doc = fitz.open(src)
+    try:
+        n_img_before = len(before_doc[0].get_images(full=True))
+    finally:
+        before_doc.close()
+    assert n_img_before >= 1
+    _mock_ocr(monkeypatch, text="Novy spravny text nahrada")
+    out = default_output_path(src)
+    job = ImportJob(src_path=src, out_path=out, pages_to_ocr=[1],
+                    suspicious_pages=[1])
+    res = process_single_job(job)
+    assert res.status == "ok", res.message
+    texts, _ = _page_texts(out)
+    assert texts[0].count("Novy spravny text nahrada") == 1
+    after_doc = fitz.open(out)
+    try:
+        assert len(after_doc[0].get_images(full=True)) >= 1  # obraz zachovan
+    finally:
+        after_doc.close()
+
+
+# Mixed PDF: zdrava beze zmeny, no-text + suspicious dostanou OCR
+def test_mixed_healthy_notext_suspicious(tmp_path, monkeypatch):
+    src = str(tmp_path / "mix.pdf")
+    doc = fitz.open()
+    _add_image_page(doc, "sken strana 1")
+    _add_text_page(doc, LONG_TEXT)
+    # strana 3: obrazek + degenerovana vrstva
+    import io as _io
+    img = Image.new("RGB", (1200, 1600), "white")
+    buf = _io.BytesIO()
+    img.save(buf, "PNG")
+    p3 = doc.new_page(width=595, height=842)
+    p3.insert_image(p3.rect, stream=buf.getvalue())
+    p3.insert_text((72, 72), "stara vadna vrstva historicke ocr " * 5, fontsize=0)
+    _save_doc(doc, src)
+    analysis = analyze_pdf(src)
+    assert analysis.pages_needing_ocr == [1, 3]
+    assert analysis.suspicious_pages == [3]
+    before, _ = _page_texts(src)
+    _mock_ocr(monkeypatch, text="Doplneny OCR text")
+    jobs, skipped = build_jobs([analysis], "Tesseract", "ces", False)
+    assert skipped == []
+    assert len(jobs) == 1
+    assert jobs[0].suspicious_pages == [3]
+    res = process_single_job(jobs[0])
+    assert res.status == "ok", res.message
+    after, n = _page_texts(str(jobs[0].out_path))
+    assert n == 3
+    assert after[1] == before[1]  # zdrava strana nedotcena
+    assert "Doplneny OCR text" in after[0]
+    assert "Doplneny OCR text" in after[2]
+    assert after[2].count("Doplneny OCR text") == 1
+
+
+# Preprocessing vetev importu
+def test_import_preprocessing_branch(tmp_path, monkeypatch):
+    import Skener as _sk
+    src = str(tmp_path / "sken.pdf")
+    _make_image_pdf(src, pages=1)
+    _mock_ocr(monkeypatch, text="preprocess text")
+    calls = []
+
+    def spy(img):
+        calls.append(True)
+        return img
+
+    monkeypatch.setattr(_sk, "preprocess_image", spy)
+    out1 = default_output_path(src)
+    res = process_single_job(ImportJob(src_path=src, out_path=out1,
+                                       pages_to_ocr=[1], preprocess_enabled=True))
+    assert res.status == "ok", res.message
+    assert calls, "preprocess_enabled=True musi aplikovat preprocess_image"
+    calls.clear()
+    if os.path.exists(out1):
+        os.remove(out1)
+    res2 = process_single_job(ImportJob(src_path=src, out_path=out1,
+                                        pages_to_ocr=[1], preprocess_enabled=False))
+    assert res2.status == "ok", res2.message
+    assert not calls, "preprocess_enabled=False nesmi sahat na obraz"
+    # build_jobs propaguje flag
+    analysis = analyze_pdf(src)
+    jobs, _ = build_jobs([analysis], "Tesseract", "ces", False,
+                         {default_output_path(src): True},
+                         preprocess_enabled=True)
+    assert jobs[0].preprocess_enabled is True
+
+
+# =====================================================================
+# EasyOCR paragraph=True parser - regrese skutecneho API (EasyOCR 1.7.2)
+# =====================================================================
+
+PARA_BBOX = [[100, 100], [500, 100], [500, 150], [100, 150]]
+PARA_TEXT = "Příliš žluťoučký kůň"
+
+
+def _para_reader(text=PARA_TEXT, bbox=None):
+    bbox = bbox if bbox is not None else [list(p) for p in PARA_BBOX]
+
+    class FakeReader:
+        def readtext(self, arr, paragraph=True):
+            assert paragraph is True
+            return [[bbox, text]]
+
+    return FakeReader()
+
+
+def test_parse_easyocr_paragraph_true():
+    from ocr_engine import parse_easyocr_results
+    raw = [[PARA_BBOX, PARA_TEXT]]
+    results, page_text = parse_easyocr_results(raw)
+    assert len(results) == 1
+    assert results[0].text == PARA_TEXT
+    assert results[0].bbox is not None
+    assert PARA_TEXT in page_text
+
+
+def test_parse_easyocr_word_level_three_items():
+    from ocr_engine import parse_easyocr_results
+    raw = [(PARA_BBOX, "Příklad", 0.95)]
+    results, page_text = parse_easyocr_results(raw)
+    assert len(results) == 1
+    assert results[0].text == "Příklad"
+    assert results[0].bbox is not None
+    assert "Příklad" in page_text
+
+
+def test_parse_easyocr_empty_stays_empty():
+    from ocr_engine import parse_easyocr_results
+    results, page_text = parse_easyocr_results([])
+    assert results == []
+    assert page_text == ""
+    # prazdny text se ignoruje, nevznikne zadny OcrResult
+    results2, _ = parse_easyocr_results([[PARA_BBOX, "   "]])
+    assert results2 == []
+
+
+def test_easyocr_sync_paragraph_true_no_failure(monkeypatch):
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader",
+                        lambda lang: _para_reader())
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.easyocr_ocr_images_sync([img], "ces (Čeština)")
+    assert len(pages) == 1 and len(pages[0]) == 1
+    assert pages[0][0].text == PARA_TEXT
+    assert pages[0][0].bbox is not None
+
+
+def test_easyocr_sync_word_level_ok(monkeypatch):
+    class FakeReader:
+        def readtext(self, arr, paragraph=True):
+            return [(PARA_BBOX, "Příklad", 0.95)]
+
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader", lambda lang: FakeReader())
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.easyocr_ocr_images_sync([img], "ces (Čeština)")
+    assert len(pages[0]) == 1
+    assert pages[0][0].text == "Příklad"
+    assert pages[0][0].bbox is not None
+
+
+def test_easyocr_sync_empty_is_real_failure(tmp_path, monkeypatch):
+    class FakeReader:
+        def readtext(self, arr, paragraph=True):
+            return []
+
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader", lambda lang: FakeReader())
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.easyocr_ocr_images_sync([img], "ces (Čeština)")
+    assert pages == [[]]
+    src = str(tmp_path / "sken.pdf")
+    _make_image_pdf(src, pages=1)
+    out = default_output_path(src)
+    res = process_single_job(ImportJob(src_path=src, out_path=out, pages_to_ocr=[1],
+                                       engine="EasyOCR", lang_raw="ces (Čeština)"))
+    assert res.status == "failed"
+    assert "nerozpoznal" in res.message
+    assert not os.path.exists(out)
+
+
+def test_easyocr_import_e2e_paragraph_true(tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader",
+                        lambda lang: _para_reader())
+    src = str(tmp_path / "sken.pdf")
+    _make_image_pdf(src, pages=1)
+    out = default_output_path(src)
+    res = process_single_job(ImportJob(src_path=src, out_path=out, pages_to_ocr=[1],
+                                       engine="EasyOCR", lang_raw="ces (Čeština)"))
+    assert res.status == "ok", res.message
+    assert "nerozpoznal" not in res.message
+    doc = fitz.open(out)
+    try:
+        assert PARA_TEXT in (doc[0].get_text() or "")
+    finally:
+        doc.close()
+
+
+@pytest.mark.parametrize("lang_raw,easy_lang", [
+    ("ces (Čeština)", "cs"),
+    ("eng (English)", "en"),
+])
+def test_easyocr_lang_mapping_paragraph_true(monkeypatch, lang_raw, easy_lang):
+    seen = {}
+
+    class FakeReader:
+        def readtext(self, arr, paragraph=True):
+            assert paragraph is True
+            return [[PARA_BBOX, "Test text"]]
+
+    def fake_ensure(lang):
+        seen["lang"] = lang
+        return FakeReader()
+
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader", fake_ensure)
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.easyocr_ocr_images_sync([img], lang_raw)
+    assert seen["lang"] == easy_lang
+    assert pages[0][0].text == "Test text"
+
+
+@pytest.mark.parametrize("diacritics_enabled", [True, False])
+def test_easyocr_paragraph_true_diacritics_on_off(monkeypatch, diacritics_enabled):
+    monkeypatch.setattr(pdf_import, "ensure_easyocr_reader",
+                        lambda lang: _para_reader())
+    img = Image.new("RGB", (400, 200), "white")
+    pages = pdf_import.easyocr_ocr_images_sync(
+        [img], "ces (Čeština)", diacritics_enabled=diacritics_enabled)
+    assert len(pages[0]) == 1
+    r = pages[0][0]
+    # text nesmi byt ztracen ani v jednom rezimu, bbox zachovan
+    assert r.text and r.text.strip()
+    assert PARA_TEXT in (r.processed_text or r.text)
+    assert r.original_text is not None and r.processed_text is not None
+    assert r.bbox is not None

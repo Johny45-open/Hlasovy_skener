@@ -27,6 +27,11 @@ Dulezita rozhodnuti (viz audit pred BUILD rezimem):
 
 3. Mixed PDF se NIKDY nerasterizuje cele. Overlay zapisuje pouze do
    stran urcenych k OCR; puvodni textove strany zustavaji nedotcene.
+   Vyjimka: strany s podezrelou (degenerovanou) textovou vrstvou
+   (napr. historicke OCR s fontsize=0) se pred overlay STRIPNOU pouze
+   o text (redakce textu, obrazky a vektorova grafika zustanou -
+   ``strip_page_text_layer``) a nahradi novou OCR vrstvou, aby
+   nevznikla duplicita stara+nova vrstva.
 
 4. Worker (``PdfImportWorker``) neprovadi ZADNE GUI operace. Komunikuje
    s GUI vlaknem vyhradne pres Qt signaly. Dialogy, speak() a
@@ -46,7 +51,7 @@ import pytesseract
 from PIL import Image
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from ocr_engine import OcrResult, LANG_MAP_EASYOCR, ensure_easyocr_reader
+from ocr_engine import OcrResult, LANG_MAP_EASYOCR, ensure_easyocr_reader, parse_easyocr_results
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,22 @@ PDF_IMPORT_OUTPUT_SUFFIX = "_OCR"
 #: Rotace stran, pro ktere umi overlay spocitat souradnice (0 = primy
 #: prepocet, 180 = zrcadleny prepocet). 90/270 se bezpecne odmitnou.
 PDF_IMPORT_SUPPORTED_ROTATIONS = (0, 180)
+
+#: Detekce podezrele (degenerovane) textove vrstvy - napr. historicke
+#: OCR s fontsize=0. Hodnoti se POUZE strany, ktere jinak prosly delkovym
+#: prahem searchable (stav C). Pri pochybnosti plati bezpecny smer: OCR.
+#: Prazdne/zdrave vrstvy se timto nikdy neprekvalifikuji.
+#: Minimalni pocet textovych bloku, aby se heuristika vubec spustila
+#: (ochrana proti false-positive u stranek s par slovy).
+PDF_SUSPICIOUS_MIN_BLOCKS = 20
+#: Podil jednoznakovych bloku (po strip), nad nim je vrstva podezrela.
+PDF_SUSPICIOUS_SINGLE_CHAR_RATIO = 0.5
+#: Podil bloku s degenerovanym bboxem (sirka/vyska <= 1pt vcetne
+#: nulovych - typicky otisk fontsize=0), nad nim je vrstva podezrela.
+PDF_SUSPICIOUS_DEGENERATE_BBOX_RATIO = 0.3
+#: Strana bez jedineho slova z get_text("words"), ale s dostatecnou delkou
+#: textu, je vzdy podezrela (text existuje, ale nema geometrii).
+PDF_SUSPICIOUS_EMPTY_WORDS_MIN_CHARS = PDF_SEARCHABLE_MIN_CHARS
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +144,15 @@ class CancelledError(PdfImportError):
 
 @dataclass
 class PdfPageNeed:
-    """Vysledek analyzy jedne strany (cislovani od 1)."""
+    """Vysledek analyzy jedne strany (cislovani od 1).
+
+    Tri-state klasifikace:
+      A) no-text            -> needs_ocr=True,  suspicious=False
+      B) zdrava vrstva      -> needs_ocr=False, suspicious=False
+      C) suspicious-layer   -> needs_ocr=True,  suspicious=True
+    Stav C znamena: nahradit starou vrstvu (strip) + nove OCR, nikoli
+    pouhy overlay nad vadny text.
+    """
     page_no: int
     needs_ocr: bool
     char_count: int = 0
@@ -132,6 +161,8 @@ class PdfPageNeed:
     block_count: int = 0
     image_count: int = 0
     rotation: int = 0
+    suspicious: bool = False
+    reason: str = ""  # "no-text" | "" | "suspicious-layer:<detail>"
 
 
 @dataclass
@@ -150,6 +181,10 @@ class PdfAnalysis:
     def pages_needing_ocr(self) -> list[int]:
         return [p.page_no for p in self.pages if p.needs_ocr]
 
+    @property
+    def suspicious_pages(self) -> list[int]:
+        return [p.page_no for p in self.pages if p.needs_ocr and p.suspicious]
+
 
 @dataclass
 class ImportJob:
@@ -160,6 +195,10 @@ class ImportJob:
     engine: str = "Tesseract"
     lang_raw: str = "ces (Čeština)"
     diacritics_enabled: bool = False
+    preprocess_enabled: bool = False
+    # Strany s podezrelou vrstvou (stav C): pred overlay se jejich stara
+    # textova vrstva odstrani (strip) a nahradi novou OCR vrstvou.
+    suspicious_pages: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -176,13 +215,69 @@ class JobResult:
 # Analyza PDF (rychla, ciste textova extrakce - vhodna i pro GUI vlakno)
 # ---------------------------------------------------------------------------
 
-def _classify_page(page: "fitz.Page", page_no: int) -> PdfPageNeed:
-    """Klasifikuje jednu stranu podle konzervativni heuristiky.
+def _is_text_layer_suspicious(page: "fitz.Page") -> tuple[bool, str]:
+    """Rozpozna degenerovanou textovou vrstvu (napr. historicke OCR s fontsize=0).
 
-    Zamerne NENI pouzito samotne ``page.get_text() == ""``. Strana je
-    povazovana za prohledavatelnou, pokud ma dostatek souvisleho textu;
-    kratke fragmenty (razitko, zahlavi skenu) bezpecne padaji do NEEDS_OCR
-    (radsi OCR navic nez ztraceny obsah - overlay textovou stranu neznici).
+    Volat POUZE pro strany, ktere jinak prosly delkovym prahem searchable.
+    Vraci (True, detail) pri podezreni, jinak (False, "").
+    Pri jakekoli chybe cteni geometrie vraci (False, "") - bezpecne se pak
+    uplatni puvodni delkova logika (strana zustane searchable).
+    Signaly (overene na PyMuPDF 1.27 + fontsize=0 vzorku):
+      - text existuje (delka), ale get_text("words") je prazdne -> geometrie chybi,
+      - vysoky podil jednoznakovych bloku (fragmentace po znacich),
+      - vysoky podil bloku s degenerovanym bboxem (nula/JUNK souradnice).
+    """
+    try:
+        text = page.get_text("text") or ""
+    except Exception:
+        return False, ""
+    if len(text.strip()) < PDF_SUSPICIOUS_EMPTY_WORDS_MIN_CHARS:
+        return False, ""
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        return False, ""
+    if not words:
+        return True, "text-bez-geometrie-slov"
+    try:
+        blocks = page.get_text("blocks") or []
+    except Exception:
+        return False, ""
+    if len(blocks) < PDF_SUSPICIOUS_MIN_BLOCKS:
+        return False, ""
+    single = 0
+    degenerate = 0
+    for b in blocks:
+        try:
+            btxt = str(b[4]) if len(b) > 4 else ""
+        except Exception:
+            btxt = ""
+        if len(btxt.strip()) <= 1:
+            single += 1
+        try:
+            x0, y0, x1, y1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        except Exception:
+            degenerate += 1
+            continue
+        if (x1 - x0) <= 1.0 or (y1 - y0) <= 1.0:
+            degenerate += 1
+    n = len(blocks)
+    if single / n >= PDF_SUSPICIOUS_SINGLE_CHAR_RATIO:
+        return True, f"jednoznakove-bloky-{single}/{n}"
+    if degenerate / n >= PDF_SUSPICIOUS_DEGENERATE_BBOX_RATIO:
+        return True, f"degenerovane-bbox-{degenerate}/{n}"
+    return False, ""
+
+
+def _classify_page(page: "fitz.Page", page_no: int) -> PdfPageNeed:
+    """Klasifikuje jednu stranu podle konzervativni heuristiky (tri-state).
+
+    A) malo textu                       -> NEEDS_OCR (reason "no-text"),
+    B) dost textu + zdrava geometrie    -> searchable (needs_ocr=False),
+    C) dost textu + podezrela geometrie -> NEEDS_OCR se stripem
+       (suspicious=True, reason "suspicious-layer:...").
+    Bezpecny smer: pri pochybnosti OCR (radsi OCR navic nez tiche
+    ponechani vadne vrstvy).
     """
     try:
         text = page.get_text("text") or ""
@@ -209,15 +304,44 @@ def _classify_page(page: "fitz.Page", page_no: int) -> PdfPageNeed:
         or (len(words) >= PDF_SEARCHABLE_MIN_WORDS
             and alnum >= PDF_SEARCHABLE_MIN_ALNUM)
     )
+    if not searchable:
+        return PdfPageNeed(
+            page_no=page_no,
+            needs_ocr=True,
+            char_count=len(stripped),
+            word_count=len(words),
+            alnum_count=alnum,
+            block_count=len(blocks),
+            image_count=len(images),
+            rotation=rotation,
+            suspicious=False,
+            reason="no-text",
+        )
+    suspicious, detail = _is_text_layer_suspicious(page)
+    if suspicious:
+        return PdfPageNeed(
+            page_no=page_no,
+            needs_ocr=True,
+            char_count=len(stripped),
+            word_count=len(words),
+            alnum_count=alnum,
+            block_count=len(blocks),
+            image_count=len(images),
+            rotation=rotation,
+            suspicious=True,
+            reason=f"suspicious-layer:{detail}",
+        )
     return PdfPageNeed(
         page_no=page_no,
-        needs_ocr=not searchable,
+        needs_ocr=False,
         char_count=len(stripped),
         word_count=len(words),
         alnum_count=alnum,
         block_count=len(blocks),
         image_count=len(images),
         rotation=rotation,
+        suspicious=False,
+        reason="",
     )
 
 
@@ -288,8 +412,13 @@ def format_analysis_summary(analysis: PdfAnalysis) -> str:
         return (f"Dokument {base} má {amount}. "
                 f"Všechny strany již obsahují použitelný text. OCR není potřeba.")
     lst = ", ".join(str(p) for p in need)
-    return (f"Dokument {base} má {n} {_stran_word(n)}. "
-            f"OCR je potřeba na {len(need)} stranách: {lst}.")
+    msg = (f"Dokument {base} má {n} {_stran_word(n)}. "
+           f"OCR je potřeba na {len(need)} stranách: {lst}.")
+    susp = [p.page_no for p in analysis.pages if p.needs_ocr and p.suspicious]
+    if susp:
+        msg += (f" Na {len(susp)} stranách ({', '.join(str(p) for p in susp)}) "
+                f"je podezřelá textová vrstva - bude nahrazena novým OCR.")
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +445,15 @@ def build_jobs(
     lang_raw: str,
     diacritics_enabled: bool,
     overwrite_allowed: dict[str, bool] | None = None,
+    preprocess_enabled: bool = False,
 ) -> tuple[list[ImportJob], list[JobResult]]:
     """Sestavi joby pro soubory potrebujici OCR.
 
     ``overwrite_allowed`` mapuje out_path -> True/False (rozhodnuti
     z GUI ``_confirm_overwrite``). Soubor s existujicim vystupem bez
     souhlasu je ``skipped`` (davka pokracuje dalsimi soubory).
+    ``preprocess_enabled`` se propise do kazdeho jobu (stejne nastaveni
+    jako bezny OCR workflow - ``preprocess_cb``).
     Vraci (jobs, skipped_results).
     """
     overwrite_allowed = overwrite_allowed or {}
@@ -345,7 +477,9 @@ def build_jobs(
         jobs.append(ImportJob(
             src_path=analysis.path, out_path=out, pages_to_ocr=need,
             engine=engine, lang_raw=lang_raw,
-            diacritics_enabled=diacritics_enabled))
+            diacritics_enabled=diacritics_enabled,
+            preprocess_enabled=preprocess_enabled,
+            suspicious_pages=[p for p in analysis.suspicious_pages if p in need]))
     return jobs, skipped
 
 
@@ -489,8 +623,17 @@ def tesseract_ocr_images_sync(
             raise
         except Exception as e:
             raise OcrEngineError(f"OCR selhalo na straně {i + 1}: {e}")
-        page_results, _ = _apply_diacritics_sync(
+        page_results, page_text_corr = _apply_diacritics_sync(
             page_results, page_text, lang_raw, diacritics_enabled)
+        if not page_results and (page_text_corr or "").strip():
+            # image_to_data() nedalo pouzitelne bboxy (conf filtr), ale
+            # image_to_string() text nasel -> page-level fallback s bbox=None.
+            # Overlay ho zapise existujicim nobbox fallbackem (spodni pruh),
+            # nikdy se tiho nezahodi. Word-level cesta tim neni dotcena.
+            raw = (page_text or "").strip()
+            corr = page_text_corr.strip()
+            page_results = [OcrResult(text=corr, bbox=None,
+                                      original_text=raw, processed_text=corr)]
         all_pages.append(page_results)
         if progress_cb is not None:
             progress_cb(i + 1, total)
@@ -523,36 +666,13 @@ def easyocr_ocr_images_sync(
             raw_results = reader.readtext(img_np, paragraph=True)
         except Exception as e:
             raise OcrEngineError(f"EasyOCR selhalo na straně {i + 1}: {e}")
-        page_text = ""
-        page_results: list[OcrResult] = []
-        for result in raw_results:
-            if len(result) == 3:
-                bbox, text, _ = result
-                page_results.append(OcrResult(text=str(text), bbox=bbox))
-                page_text += result[1]
-            else:
-                word_results, _ = result
-                if not isinstance(word_results, list) or not word_results:
-                    continue
-                texts, all_bboxes = [], []
-                for word in word_results:
-                    if isinstance(word, (list, tuple)) and len(word) >= 3:
-                        texts.append(str(word[1]))
-                        all_bboxes.append(word[0])
-                text = " ".join(texts)
-                if not text.strip():
-                    continue
-                if all_bboxes:
-                    xs = [p[0] for b in all_bboxes for p in b]
-                    ys = [p[1] for b in all_bboxes for p in b]
-                    bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                            [max(xs), max(ys)], [min(xs), max(ys)]]
-                else:
-                    bbox = None
-                page_results.append(OcrResult(text=text, bbox=bbox))
-                page_text += text + "\n"
-        page_results, _ = _apply_diacritics_sync(
+        page_results, page_text = parse_easyocr_results(raw_results)
+        page_results, page_text_corr = _apply_diacritics_sync(
             page_results, page_text, lang_raw, diacritics_enabled)
+        # EasyOCR nema divergentni image_to_string vetvu (page_text se sklada
+        # z raw_results), takze prazdne raw_results == prazdne OCR == failure
+        # vyse v process_single_job. Zadny dodatecny fallback se nepridava.
+        _ = page_text_corr
         all_pages.append(page_results)
         if progress_cb is not None:
             progress_cb(i + 1, total)
@@ -576,6 +696,50 @@ def ocr_images_sync(
 
 
 # ---------------------------------------------------------------------------
+# Odstraneni podezrele textove vrstvy (stav C) - redakce pouze textu
+# ---------------------------------------------------------------------------
+
+def strip_page_text_layer(page: "fitz.Page") -> int:
+    """Odstrani textovou vrstvu strany, obrazky a vektorovou grafiku zachova.
+
+    Overena podporovana varianta (PyMuPDF): redakcni anotace + ``apply_redactions``
+    s ``images=IMAGE_NONE, graphics=LINE_ART_NONE, text=TEXT_REMOVE``.
+    Zadna rasterizace, zadny rebuild content streamu, zadny hack.
+    Obrazovy obsah (scan) a vektorova grafika zustavaji nedotceny.
+    Vizuálni dopad: neviditelny text (fontsize=0) zmizi beze stopy;
+    viditelny fragmentovany text je odstranen zamerne (je vadny a bude
+    nahrazen novou OCR vrstvou).
+    Vraci pocet pridanych redakcnich anotaci.
+    """
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        words = []
+    try:
+        if words:
+            for w in words:
+                try:
+                    page.add_redact_annot(fitz.Rect(w[0], w[1], w[2], w[3]))
+                except Exception:
+                    continue
+            n = len(words)
+        else:
+            # Degenerovana vrstva bez geometrie slov (typicky fontsize=0):
+            # jedina anotace pres celou stranu. Obrazky/grafika jsou
+            # chraneny parametry IMAGE_NONE / LINE_ART_NONE.
+            page.add_redact_annot(page.rect)
+            n = 1
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE,
+        )
+        return n
+    except Exception as e:
+        raise SaveError(f"Starou textovou vrstvu strany se nepodařilo odstranit: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Overlay OCR vrstvy do KOPIE originalu (textove strany nedotceny)
 # ---------------------------------------------------------------------------
 
@@ -586,6 +750,7 @@ def overlay_ocr_layer(
     out_path: str = "",
     progress_cb: Optional[Callable[[int, int], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    pages_strip_text: Optional[set[int] | list[int]] = None,
 ) -> dict:
     """Prida neviditelnou OCR vrstvu pouze na zadane strany kopie PDF.
 
@@ -593,6 +758,10 @@ def overlay_ocr_layer(
     Pouziva existujici ``Skener._insert_ocr_textbox_invisible()`` -
     zadna druha implementace vrstvy. Strany mimo ``ocr_by_page``
     zustanou bitove nedotcene (pouze se prekopiruji).
+    Strany v ``pages_strip_text`` (stav C suspicious-layer): jejich stara
+    vadna textova vrstva se NEJPRVE odstrani (strip pouze textu, obrazky
+    a grafika zustanou) a pak se prida nova OCR vrstva. Vysledkem je
+    jedina pouzitelna vrstva, nikdy dublovana stara+nova.
     """
     # Lazy import - zamezi cyklickemu importu Skener <-> pdf_import.
     try:
@@ -648,6 +817,19 @@ def overlay_ocr_layer(
             except Exception as e:
                 raise FontError(f"Registrace Unicode fontu selhala: {e}")
             stats["pages"] += 1
+            strip_set = set(pages_strip_text or [])
+            if page_no in strip_set:
+                # Stav C: nejprve odstranit vadnou vrstvu (pouze text),
+                # pak pridat novou. Poradi je zavazne - jinak duplicita.
+                removed = strip_page_text_layer(page)
+                stats.setdefault("stripped", 0)
+                stats["stripped"] += 1
+                logger.warning("Strana %d: odstranen podezrely text (%d anotaci) pred novym OCR.",
+                               page_no, removed)
+                try:
+                    page.insert_font(fontname=_OCR_PDF_FONTNAME, fontfile=fontfile)
+                except Exception as e:
+                    raise FontError(f"Registrace Unicode fontu selhala: {e}")
             nobbox_texts: list[str] = []
             for item in ocr_by_page.get(page_no, []):
                 txt = getattr(item, "display_text", None)
@@ -873,6 +1055,15 @@ def process_single_job(
             def _ocr_progress(done: int, _sub: int) -> None:
                 if on_page is not None:
                     on_page(f"strana {done} z {total} (OCR)")
+            if getattr(job, "preprocess_enabled", False):
+                # Stejne predzpracovani jako bezny OCR workflow.
+                # preprocess_image() nemeni rozmery -> bbox kompatibilni.
+                # Lazy import (cyklus-safe, vzor overlay_ocr_layer).
+                try:
+                    from Skener import preprocess_image as _preprocess
+                except Exception as e:
+                    raise OcrEngineError(f"Předzpracování obrazu není dostupné: {e}")
+                images = [_preprocess(im) for im in images]
             ocr_pages = ocr_images_sync(
                 images, job.engine, job.lang_raw, job.diacritics_enabled,
                 progress_cb=_ocr_progress, is_cancelled=is_cancelled)
@@ -890,7 +1081,8 @@ def process_single_job(
                     on_page(f"strana {done} z {total} (zápis)")
             stats = overlay_ocr_layer(
                 job.src_path, ocr_by_page, PDF_IMPORT_RENDER_DPI, job.out_path,
-                progress_cb=_ov_progress, is_cancelled=is_cancelled)
+                progress_cb=_ov_progress, is_cancelled=is_cancelled,
+                pages_strip_text=set(getattr(job, "suspicious_pages", None) or []))
             logger.info("Import OK: %s -> %s stats=%s", job.src_path, job.out_path, stats)
             problems = validate_imported_pdf(job.out_path, page_count, ocr_by_page, original_texts)
             if problems:

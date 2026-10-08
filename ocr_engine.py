@@ -46,6 +46,55 @@ def _extract_lang_code(lang_combo_text: str) -> str:
     return lang_combo_text.split()[0]
 
 
+def parse_easyocr_results(raw_results) -> tuple[list["OcrResult"], str]:
+    """Společný parser výstupu ``Reader.readtext()`` (čistá funkce).
+
+    Podporuje skutečné formáty EasyOCR 1.7.2 (``output_format='standard'``):
+      A) ``paragraph=True``  -> ``[bbox, text]`` (``len == 2``, bez confidence),
+      B) ``paragraph=False`` -> ``[bbox, text, confidence]`` (``len == 3``).
+
+    Vrací ``(page_results, page_text)`` kde každý nalezený celek je
+    v ``page_text`` oddělen ``"\\n"``. Položky s prázdným textem
+    (po ``strip()``) se ignorují. Neznámé tvary (jiná délka) se tiše
+    přeskočí. Prázdné ``raw_results == []`` zůstává prázdným výsledkem
+    (volající ho vyhodnotí jako OCR failure) - žádný fallback se zde
+    nepřidává.
+
+    Záměrně bez závislostí na QThread/GUI/fitz/PIL/progress - volají ji
+    ``EasyOCRThread.run()`` i ``pdf_import.easyocr_ocr_images_sync()``.
+    Diakritizaci neprovádí, tu aplikuje volající dodatečně (zachování
+    ``original_text`` / ``processed_text``).
+    """
+    page_results: list["OcrResult"] = []
+    page_text = ""
+    if not raw_results:
+        return page_results, page_text
+    for result in raw_results:
+        try:
+            n = len(result)
+        except Exception:
+            continue
+        if n == 2:
+            # paragraph=True: [bbox, text]
+            try:
+                bbox, text = result
+            except Exception:
+                continue
+        elif n == 3:
+            # paragraph=False: [bbox, text, confidence]
+            try:
+                bbox, text, _ = result
+            except Exception:
+                continue
+        else:
+            continue
+        if not str(text or "").strip():
+            continue
+        page_results.append(OcrResult(text=str(text), bbox=bbox))
+        page_text += str(text) + "\n"
+    return page_results, page_text
+
+
 # ---------------------------------------------------------------------------
 # EasyOCR – správa Readerů, cache a synchronizace
 # ---------------------------------------------------------------------------
@@ -346,37 +395,7 @@ class EasyOCRThread(QThread):
             img_np = np.array(img)
             raw_results = EasyOCRThread._reader.readtext(img_np, paragraph=True)
 
-            page_text = ""
-            page_results: list[OcrResult] = []
-            for result in raw_results:
-                if len(result) == 3:
-                    bbox, text, _ = result
-                    page_results.append(OcrResult(text=str(text), bbox=bbox))
-                else:
-                    word_results, _ = result
-                    if not isinstance(word_results, list) or not word_results:
-                        continue
-                    texts = []
-                    all_bboxes = []
-                    for word in word_results:
-                        if isinstance(word, (list, tuple)) and len(word) >= 3:
-                            texts.append(str(word[1]))
-                            all_bboxes.append(word[0])
-                    text = " ".join(texts)
-                    if not text.strip():
-                        continue
-                    if all_bboxes:
-                        xs = [p[0] for b in all_bboxes for p in b]
-                        ys = [p[1] for b in all_bboxes for p in b]
-                        bbox = [
-                            [min(xs), min(ys)], [max(xs), min(ys)],
-                            [max(xs), max(ys)], [min(xs), max(ys)],
-                        ]
-                    else:
-                        bbox = None
-                    page_results.append(OcrResult(text=text, bbox=bbox))
-
-                page_text += result[1] if len(result) == 3 else text + "\n"
+            page_results, page_text = parse_easyocr_results(raw_results)
 
             # --- Volitelná diakritizace (mimo GUI vlákno) ---
             try:

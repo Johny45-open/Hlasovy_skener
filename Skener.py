@@ -2746,6 +2746,7 @@ class ScanApp(QWidget):
             pass
         lang_raw = self.lang_combo.currentText()
         diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
+        preprocess_enabled = self.preprocess_cb.isChecked() if hasattr(self, "preprocess_cb") else False
 
         # Predbezna kontrola konfliktu nazvu - VZDY v GUI vlakne.
         overwrite_allowed: dict[str, bool] = {}
@@ -2759,7 +2760,8 @@ class ScanApp(QWidget):
                 else:
                     overwrite_allowed[out] = False
         jobs, skipped = pdf_import.build_jobs(
-            analyses, engine, lang_raw, diac_enabled, overwrite_allowed)
+            analyses, engine, lang_raw, diac_enabled, overwrite_allowed,
+            preprocess_enabled=preprocess_enabled)
         if not jobs:
             speak("Žádný soubor k zpracování. Import ukončen.")
             detail = "\n".join(s.message for s in skipped) or "Ukládání bylo zrušeno."
