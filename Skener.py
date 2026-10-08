@@ -26,9 +26,20 @@ import fitz
 from accessible_output2.outputs.auto import Auto
 
 from scanner_engine import NAPS2Scanner, ScanThread
-from ocr_engine import create_ocr_thread, OcrResult
+from ocr_engine import create_ocr_thread, OcrResult, LANG_MAP_EASYOCR
+from ocr_engine import (
+    EasyOCRPreloadThread,
+    is_easyocr_ready,
+    is_easyocr_preparing,
+    is_easyocr_failed,
+    get_easyocr_status,
+    _is_easyocr_model_cached,
+)
 from macro import Macro, MacroManager, PipelineRunner
 from macro_editor import MacroEditorDialog
+
+import logging
+logger = logging.getLogger(__name__)
 
 # ------------------ Hlasový výstup ------------------
 _speaker = Auto()
@@ -51,6 +62,219 @@ def alt_preprocess_image(img: Image.Image) -> Image.Image:
     img = img.filter(ImageFilter.MedianFilter(3))
     img = ImageOps.autocontrast(img, cutoff=1)
     return img
+
+# ------------------ OCR PDF: neviditelná textová vrstva ------------------
+# Princip: obraz skenu + neviditelný Unicode text (PDF Tr 3 / render_mode=3).
+# Nikdy nepoužívat fontsize=0 ani fill_opacity=0 jako "zneviditelnění".
+_OCR_PDF_FONTNAME = "ocr-cs-sans"
+_OCR_PDF_BUNDLED_FONT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets", "fonts", "DejaVuSans.ttf",
+)
+_OCR_PDF_MIN_FONTSIZE = 4.0
+_OCR_PDF_MAX_START_FONTSIZE = 12.0
+_OCR_PDF_SHRINK_FACTOR = 0.9
+
+
+def _resolve_ocr_pdf_fontfile() -> Optional[str]:
+    """Najde Unicode TTF pro OCR vrstvu. Bundlovaný má přednost před systémovým."""
+    candidates = [
+        _OCR_PDF_BUNDLED_FONT,
+        r"C:\Windows\Fonts\DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def _ocr_pdf_initial_fontsize(rect: "fitz.Rect") -> float:
+    """Výchozí velikost písma z výšky bboxu v bodech. Nikdy <= 0."""
+    try:
+        h = float(rect.height)
+    except Exception:
+        h = 0.0
+    if h <= 0:
+        return 10.0
+    # Odstavcové bboxy (EasyOCR paragraph=True) mohou mít výšku celé stránky –
+    # start clampneme na čitelný strop, shrink-loop zbytek dořeší.
+    start = h * 0.9 if h <= 24.0 else _OCR_PDF_MAX_START_FONTSIZE
+    return max(_OCR_PDF_MIN_FONTSIZE, min(start, 72.0))
+
+
+def _insert_ocr_textbox_invisible(page: "fitz.Page", rect: "fitz.Rect",
+                                  text: str, fontname: str,
+                                  start_fontsize: float) -> str:
+    """Vloží neviditelný text (render_mode=3). Vrací 'ok' | 'shrunk' | 'fallback' | 'failed'.
+
+    Nikdy nepoužije fontsize <= 0. Záporný návrat insert_textbox() řeší
+    postupným zmenšováním; krajní fallback je insert_text na levý horní roh
+    bboxu – text je zachován, stále neviditelný, zalogovaný.
+    """
+    if not text or not text.strip():
+        return "ok"
+    fs = max(_OCR_PDF_MIN_FONTSIZE, float(start_fontsize or 10.0))
+    if fs <= 0:
+        fs = 10.0
+    shrunk = False
+    for _ in range(25):
+        try:
+            ret = page.insert_textbox(rect, text, fontsize=fs,
+                                      fontname=fontname, render_mode=3)
+        except Exception as e:
+            logger.warning("OCR PDF insert_textbox selhal (fs=%.2f): %s", fs, e)
+            ret = -1.0
+        if ret is not None and ret >= 0:
+            return "shrunk" if shrunk else "ok"
+        # Overflow – zmenšit, ale nikdy na 0.
+        next_fs = max(_OCR_PDF_MIN_FONTSIZE, fs * _OCR_PDF_SHRINK_FACTOR)
+        if next_fs >= fs:
+            break
+        fs = next_fs
+        shrunk = True
+        if fs <= _OCR_PDF_MIN_FONTSIZE + 1e-9:
+            # Ještě jeden pokus s minimem, pak fallback.
+            try:
+                ret = page.insert_textbox(rect, text, fontsize=fs,
+                                          fontname=fontname, render_mode=3)
+            except Exception as e:
+                logger.warning("OCR PDF insert_textbox (min) selhal: %s", e)
+                ret = -1.0
+            if ret is not None and ret >= 0:
+                return "shrunk"
+            break
+    # Explicitní fallback: text nesmí být tiše zahozen.
+    try:
+        pt = fitz.Point(rect.x0 + 1, rect.y0 + _OCR_PDF_MIN_FONTSIZE)
+        page.insert_text(pt, text, fontsize=_OCR_PDF_MIN_FONTSIZE,
+                         fontname=fontname, render_mode=3)
+        logger.warning("OCR PDF fallback insert_text pro text %r (bbox %s)",
+                       text[:60], rect)
+        return "fallback"
+    except Exception as e:
+        logger.error("OCR PDF fallback selhal pro text %r: %s", text[:60], e)
+        return "failed"
+
+
+def build_searchable_pdf(images: list[Image.Image],
+                          ocr_pages: list[list],
+                          dpi: int,
+                          output_path: str) -> dict:
+    """Sestaví prohledávatelné PDF: obraz + neviditelná Unicode vrstva.
+
+    Testovatelná bez Qt. Zachovává převod px->pt (x/dpi*72) i konzistenci
+    OCR-obraz vs. PDF-obraz (volající předává stejné objekty).
+    Statistiky: {pages, inserted, shrunk, fallback, failed, nobbox}.
+    """
+    if dpi is None or int(dpi) <= 0:
+        dpi = 300
+    dpi = int(dpi)
+    fontfile = _resolve_ocr_pdf_fontfile()
+    if fontfile is None:
+        logger.error("OCR PDF: Unicode font nenalezen (assets/fonts/DejaVuSans.ttf "
+                     "ani systémový DejaVuSans.ttf). PDF by mělo poškozenou diakritiku.")
+        raise RuntimeError(
+            "Pro PDF s rozpoznaným textem chybí Unicode font "
+            "(assets/fonts/DejaVuSans.ttf). Přeinstalujte aplikaci."
+        )
+    stats = {"pages": 0, "inserted": 0, "shrunk": 0,
+             "fallback": 0, "failed": 0, "nobbox": 0}
+    doc = fitz.open()
+    try:
+        for i, img in enumerate(images):
+            page = doc.new_page(width=img.width / dpi * 72,
+                                height=img.height / dpi * 72)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp_path = tmp.name
+                    img.save(tmp_path, "JPEG", quality=95)
+                page.insert_image(page.rect, filename=tmp_path)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+            try:
+                page.insert_font(fontname=_OCR_PDF_FONTNAME, fontfile=fontfile)
+            except Exception as e:
+                logger.error("OCR PDF: registrace fontu selhala: %s", e)
+                raise RuntimeError(f"Registrace Unicode fontu selhala: {e}")
+            stats["pages"] += 1
+            nobbox_texts: list[str] = []
+            if i < len(ocr_pages):
+                for item in ocr_pages[i]:
+                    txt = getattr(item, "display_text", None)
+                    if txt is None:
+                        txt = getattr(item, "text", "")
+                    if callable(txt):
+                        try:
+                            txt = txt()
+                        except Exception:
+                            txt = ""
+                    if not txt or not str(txt).strip():
+                        continue
+                    txt = str(txt)
+                    bbox = getattr(item, "bbox", None)
+                    if bbox is None:
+                        nobbox_texts.append(txt)
+                        continue
+                    try:
+                        x0, y0 = float(bbox[0][0]), float(bbox[0][1])
+                        x1, y1 = float(bbox[2][0]), float(bbox[2][1])
+                    except Exception as e:
+                        logger.warning("OCR PDF: neplatný bbox %r (%s) – použit fallback.", bbox, e)
+                        nobbox_texts.append(txt)
+                        continue
+                    if x1 <= x0 or y1 <= y0:
+                        logger.warning("OCR PDF: degenerovaný bbox %r – použit fallback.", bbox)
+                        nobbox_texts.append(txt)
+                        continue
+                    rect = fitz.Rect(x0 / dpi * 72, y0 / dpi * 72,
+                                     x1 / dpi * 72, y1 / dpi * 72)
+                    res = _insert_ocr_textbox_invisible(
+                        page, rect, txt, _OCR_PDF_FONTNAME,
+                        _ocr_pdf_initial_fontsize(rect))
+                    if res in ("ok", "shrunk", "fallback"):
+                        stats["inserted"] += 1
+                    if res == "shrunk":
+                        stats["shrunk"] += 1
+                    elif res == "fallback":
+                        stats["fallback"] += 1
+                    elif res == "failed":
+                        stats["failed"] += 1
+            if nobbox_texts:
+                stats["nobbox"] += len(nobbox_texts)
+                logger.warning("OCR PDF: strana %d má %d položek bez bbox – "
+                               "fallback do spodního pruhu.", i + 1, len(nobbox_texts))
+                strip = fitz.Rect(36, page.rect.height - 72,
+                                  page.rect.width - 36, page.rect.height - 36)
+                joined = "\n".join(nobbox_texts)
+                res = _insert_ocr_textbox_invisible(
+                    page, strip, joined, _OCR_PDF_FONTNAME, 8.0)
+                if res in ("ok", "shrunk", "fallback"):
+                    stats["inserted"] += len(nobbox_texts)
+                if res == "shrunk":
+                    stats["shrunk"] += 1
+                elif res == "fallback":
+                    stats["fallback"] += 1
+                elif res == "failed":
+                    stats["failed"] += len(nobbox_texts)
+        doc.save(output_path)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    if stats["failed"]:
+        logger.error("OCR PDF: %d textů se nepodařilo vložit: %s", stats["failed"], output_path)
+    return stats
 
 # ------------------ Náhled dialog ------------------
 class PreviewDialog(QDialog):
@@ -478,9 +702,22 @@ class ScanApp(QWidget):
         # Flag pro jednorázové nastavení počátečního fokusu po zobrazení okna
         self._initial_focus_done: bool = False
 
+        # EasyOCR preload – nesmí blokovat GUI
+        self._easyocr_preload_thread: EasyOCRPreloadThread | None = None
+        self._easyocr_pending_ocr: dict | None = None  # uložené parametry OCR během přípravy
+        self._easyocr_status_text: str = ""
+
         self._build_ui()
         self._setup_shortcuts()
         self._load_settings()
+        # Propojení změn jazyka/enginu s preloadem (mimo GUI blokaci)
+        try:
+            self.lang_combo.currentTextChanged.connect(self._on_engine_or_lang_changed)
+            self.engine_combo.currentTextChanged.connect(self._on_engine_or_lang_changed)
+        except Exception:
+            pass
+        # Preload naplánovat až po event loop – GUI se zobrazí → fokus → příprava na pozadí
+        QTimer.singleShot(0, self._preload_easyocr_if_needed)
 
     def speak(self, text: str) -> None:
         speak(text)
@@ -537,6 +774,22 @@ class ScanApp(QWidget):
         lbl_diac.setBuddy(self.diacritics_cb)
         ocr_layout.addWidget(lbl_diac)
         ocr_layout.addWidget(self.diacritics_cb)
+
+        # Stav EasyOCR – přístupný text + retry akce
+        self.easyocr_status_label = QLabel("EasyOCR: nepřipraven")
+        self.easyocr_status_label.setAccessibleName("Stav EasyOCR")
+        self.easyocr_status_label.setAccessibleDescription("Informuje o stavu přípravy EasyOCR pro odečítání textu.")
+        self.easyocr_status_label.setWordWrap(True)
+        self.easyocr_status_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.easyocr_status_label.setStyleSheet("color: palette(mid);")
+        ocr_layout.addWidget(self.easyocr_status_label)
+
+        self.btn_retry_easyocr = QPushButton("Připravit EasyOCR znovu")
+        self.btn_retry_easyocr.setAccessibleName("Připravit EasyOCR znovu")
+        self.btn_retry_easyocr.setAccessibleDescription("Znovu připraví EasyOCR. Používá stejný worker a nevytvoří duplicitní stahování.")
+        self.btn_retry_easyocr.clicked.connect(self._on_retry_easyocr_clicked)
+        self.btn_retry_easyocr.hide()
+        ocr_layout.addWidget(self.btn_retry_easyocr)
 
         ocr_group.setLayout(ocr_layout)
         layout.addWidget(ocr_group)
@@ -701,7 +954,8 @@ class ScanApp(QWidget):
 
         # -- Tab order --
         self.setTabOrder(self.lang_combo, self.engine_combo)
-        self.setTabOrder(self.engine_combo, self.preprocess_cb)
+        self.setTabOrder(self.engine_combo, self.btn_retry_easyocr)
+        self.setTabOrder(self.btn_retry_easyocr, self.preprocess_cb)
         self.setTabOrder(self.preprocess_cb, self.diacritics_cb)
         self.setTabOrder(self.diacritics_cb, self.batch_cb)
         self.setTabOrder(self.batch_cb, self.device_combo)
@@ -835,6 +1089,182 @@ class ScanApp(QWidget):
         self.batch_cb.setChecked(self.settings.value("scan/batch", False, type=bool))
         self.preprocess_cb.setChecked(self.settings.value("ocr/preprocess", True, type=bool))
         self.diacritics_cb.setChecked(self.settings.value("ocr/diacritics", False, type=bool))
+
+    # ---------- EasyOCR preload (startup, změna jazyka, retry) ----------
+    def _easyocr_lang_for_current_settings(self) -> str:
+        raw = self.lang_combo.currentText() if hasattr(self, "lang_combo") else "ces"
+        pyt_code = raw.split()[0].strip()
+        return LANG_MAP_EASYOCR.get(pyt_code, pyt_code[:2])
+
+    def _preload_easyocr_if_needed(self, force: bool = False) -> None:
+        """Připraví EasyOCR na pozadí pokud je zvolen jako engine.
+        Nespouští se v GUI vlákně, používá EasyOCRPreloadThread.
+        """
+        try:
+            engine = self.engine_combo.currentText() if hasattr(self, "engine_combo") else ""
+        except Exception:
+            engine = ""
+        # Preferované chování: připravuj pouze pokud je EasyOCR aktuálně zvolený
+        if engine != "EasyOCR" and not force:
+            # Informovat pouze že není potřeba, ale nehlásit chybu
+            self._update_easyocr_status_label("idle", "EasyOCR není zvolen.")
+            logger.info("EasyOCR preload skip – engine=%s", engine)
+            return
+        easy_lang = self._easyocr_lang_for_current_settings()
+        # Pokud už ready → pouze informuj, nestahuj znovu
+        if is_easyocr_ready(easy_lang):
+            self._update_easyocr_status_label("ready", f"EasyOCR je připraven ({easy_lang}).")
+            # Potlačit duplicitní hlas pokud už bylo oznámeno
+            logger.info("EasyOCR already ready lang=%s", easy_lang)
+            return
+        if is_easyocr_preparing(easy_lang):
+            self._update_easyocr_status_label("preparing", "EasyOCR se připravuje.")
+            logger.info("EasyOCR already preparing lang=%s", easy_lang)
+            return
+        # Pokud předchozí thread ještě běží (jiný jazyk), počkej na dokončení – nezahazuj
+        if self._easyocr_preload_thread is not None and self._easyocr_preload_thread.isRunning():
+            logger.info("EasyOCR preload already running, queued lang=%s", easy_lang)
+            # Necháme doběhnout předchozí, nový jazyk se načte při příštím OCR nebo po dokončení
+            # Ale pro změnu jazyka spustíme nový pokud je jiný jazyk
+            # Aby nedošlo k souběhu stejného modelu, zkontroluj lang
+            # Pokud je to jiný jazyk než aktuální thread, spustíme nový po dokončení
+            # Pro jednoduchost: nezahajuj druhý pokud první běží
+            self._update_easyocr_status_label("preparing", "EasyOCR se připravuje.")
+            return
+        # Zahájit přípravu na pozadí
+        logger.info("EasyOCR preload start lang=%s engine=%s", easy_lang, engine)
+        self._update_easyocr_status_label("preparing", "Připravuji OCR.")
+        speak("Připravuji OCR.")
+        # Informovat zda bude stahování (pouze pro log/hlas)
+        try:
+            if not _is_easyocr_model_cached(easy_lang):
+                # hlas pro stahování přijde z worker signálu, ale můžeme připravit
+                logger.info("EasyOCR model not cached, will download lang=%s", easy_lang)
+        except Exception:
+            pass
+        # Vytvoř nový worker
+        thread = EasyOCRPreloadThread(easy_lang)
+        thread.started.connect(self._on_easyocr_started)
+        thread.downloading.connect(self._on_easyocr_downloading)
+        thread.finished_ok.connect(self._on_easyocr_ready)
+        thread.failed.connect(self._on_easyocr_failed)
+        thread.progress_msg.connect(self._on_easyocr_progress_msg)
+        # Uložení reference aby nebyl GC
+        self._easyocr_preload_thread = thread
+        thread.finished.connect(lambda: self._on_easyocr_thread_finished(thread))
+        thread.start()
+
+    def _on_easyocr_thread_finished(self, thread) -> None:
+        # Uklidit referenci pokud je to aktuální thread
+        try:
+            if self._easyocr_preload_thread is thread:
+                # Ponech referenci krátce, pak vyčisti – ale nech signály doběhnout
+                pass
+        except Exception:
+            pass
+
+    def _update_easyocr_status_label(self, state: str, text: str) -> None:
+        self._easyocr_status_text = text
+        try:
+            if hasattr(self, "easyocr_status_label") and self.easyocr_status_label is not None:
+                # Map state na přístupný text
+                if state == "ready":
+                    label = "EasyOCR je připraven."
+                elif state == "preparing":
+                    label = "EasyOCR se připravuje."
+                elif state == "failed":
+                    label = "EasyOCR se nepodařilo připravit."
+                elif state == "idle":
+                    label = "EasyOCR není zvolen."
+                else:
+                    label = text
+                self.easyocr_status_label.setText(label)
+                self.easyocr_status_label.setAccessibleName("Stav EasyOCR")
+                self.easyocr_status_label.setAccessibleDescription(label)
+                # Pro NVDA – změna textu je oznámena; doplň speak kde je vhodné
+        except Exception:
+            pass
+        # řízení viditelnosti retry tlačítka
+        try:
+            if hasattr(self, "btn_retry_easyocr"):
+                if state == "failed":
+                    self.btn_retry_easyocr.show()
+                    self.btn_retry_easyocr.setEnabled(True)
+                elif state == "ready":
+                    self.btn_retry_easyocr.hide()
+                elif state == "preparing":
+                    self.btn_retry_easyocr.hide()
+                elif state == "idle":
+                    self.btn_retry_easyocr.hide()
+        except Exception:
+            pass
+
+    def _on_easyocr_started(self, lang: str) -> None:
+        logger.info("EasyOCR started lang=%s", lang)
+        self._update_easyocr_status_label("preparing", "EasyOCR se připravuje.")
+        speak("Připravuji OCR.")
+
+    def _on_easyocr_downloading(self, lang: str) -> None:
+        logger.info("EasyOCR downloading lang=%s", lang)
+        self._update_easyocr_status_label("preparing", "Stahuji model pro EasyOCR.")
+        speak("Stahuji model pro EasyOCR.")
+
+    def _on_easyocr_ready(self, lang: str) -> None:
+        logger.info("EasyOCR ready lang=%s", lang)
+        self._update_easyocr_status_label("ready", "EasyOCR je připraven.")
+        speak("EasyOCR je připraven.")
+        # Pokud byl OCR požadavek odložen během přípravy, spusť jej nyní
+        if self._easyocr_pending_ocr is not None:
+            pending = self._easyocr_pending_ocr
+            self._easyocr_pending_ocr = None
+            logger.info("EasyOCR running pending OCR after ready lang=%s", lang)
+            # pending obsahuje {"mode": "full"/"incremental", "start_idx": int}
+            try:
+                if pending.get("mode") == "incremental":
+                    self._run_ocr_incremental(pending.get("start_idx", 0))
+                else:
+                    self._run_ocr_flow(interactive=pending.get("interactive", True))
+            except Exception as e:
+                logger.exception("Pending OCR failed after preload: %s", e)
+
+    def _on_easyocr_failed(self, lang: str, err: str) -> None:
+        logger.error("EasyOCR failed lang=%s err=%s", lang, err)
+        self._update_easyocr_status_label("failed", "EasyOCR se nepodařilo připravit.")
+        speak("EasyOCR se nepodařilo připravit. Zkontrolujte připojení k internetu a zkuste to znovu.")
+        # pending OCR zůstane – uživatel musí explicitně opakovat nebo kliknout retry
+        # ale nezahazuj pending, aby mohl po retry pokračovat
+        # QMessageBox nezobrazovat automaticky při startu – pouze hlas a label
+
+    def _on_easyocr_progress_msg(self, msg: str) -> None:
+        # Nepřehlušovat – pouze log
+        logger.info("EasyOCR progress_msg: %s", msg)
+
+    def _on_retry_easyocr_clicked(self) -> None:
+        logger.info("EasyOCR retry clicked")
+        speak("Připravuji EasyOCR znovu.")
+        self._preload_easyocr_if_needed(force=True)
+        # Po kliknutí přesuň fokus zpět na stavový label pro potvrzení
+        try:
+            self.easyocr_status_label.setFocus()
+        except Exception:
+            pass
+
+    def _on_engine_or_lang_changed(self) -> None:
+        # Uložit nastavení a případně spustit preload pro nový jazyk
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        # Pokud je zvolen EasyOCR, připrav nový jazyk na pozadí (pokud není cached)
+        try:
+            engine = self.engine_combo.currentText()
+            if engine == "EasyOCR":
+                # Nezahlcovat – preload zkontroluje ready/preparing
+                QTimer.singleShot(100, self._preload_easyocr_if_needed)
+            else:
+                self._update_easyocr_status_label("idle", "EasyOCR není zvolen.")
+        except Exception:
+            pass
 
     def _on_diacritics_toggled(self, checked: bool) -> None:
         # Hlasová odezva při přepnutí
@@ -1203,11 +1633,57 @@ class ScanApp(QWidget):
         speak(f"Všech {count} stránek smazáno.")
         self.btn_scan.setFocus()
 
+    # ---------- OCR – guard pro EasyOCR preload ----------
+    def _handle_easyocr_guard_before_ocr(self, engine: str, lang_raw: str, pending_info: dict) -> bool:
+        """Vrátí True pokud lze pokračovat, False pokud byl OCR odložen nebo zablokován.
+        Zajišťuje: žádný duplicitní Reader, žádný pád, přístupná hláška.
+        """
+        if engine != "EasyOCR":
+            return True
+        easy_lang = LANG_MAP_EASYOCR.get(lang_raw.split()[0].strip(), lang_raw.split()[0].strip()[:2])
+        if is_easyocr_preparing(easy_lang):
+            # Uložit pending pouze pokud ještě není
+            if self._easyocr_pending_ocr is None:
+                self._easyocr_pending_ocr = pending_info
+            speak("EasyOCR se ještě připravuje. OCR bude spuštěno po dokončení přípravy.")
+            self._update_easyocr_status_label("preparing", "EasyOCR se ještě připravuje. OCR bude spuštěno po dokončení přípravy.")
+            # Zajistit že preload běží (pokud z nějakého důvodu neběží)
+            if self._easyocr_preload_thread is None or not self._easyocr_preload_thread.isRunning():
+                # Pro jistotu znovu spustit
+                try:
+                    self._preload_easyocr_if_needed()
+                except Exception:
+                    pass
+            return False
+        if is_easyocr_failed(easy_lang):
+            speak("EasyOCR se nepodařilo připravit. Zkontrolujte připojení k internetu a zkuste to znovu.")
+            # Ukaž retry tlačítko
+            self._update_easyocr_status_label("failed", "EasyOCR se nepodařilo připravit.")
+            QMessageBox.warning(self, "EasyOCR není připraven", "EasyOCR se nepodařilo připravit. Zkontrolujte připojení k internetu a zkuste to znovu.\n\nKlikněte na 'Připravit EasyOCR znovu'.")
+            return False
+        if not is_easyocr_ready(easy_lang):
+            # Není připraven a není preparing ani failed -> zahájit přípravu a odložit OCR
+            if self._easyocr_pending_ocr is None:
+                self._easyocr_pending_ocr = pending_info
+            speak("EasyOCR se ještě připravuje. OCR bude spuštěno po dokončení přípravy.")
+            self._update_easyocr_status_label("preparing", "EasyOCR se připravuje.")
+            try:
+                self._preload_easyocr_if_needed(force=True)
+            except Exception:
+                pass
+            return False
+        return True
+
     # ---------- OCR ----------
     def _run_ocr_incremental(self, start_idx: int) -> None:
         """OCR pouze pro nově přidané stránky start_idx..end, zachová 1..start_idx-1."""
         new_images = self.scanned_images[start_idx:]
         if not new_images:
+            return
+        # Guard – pokud EasyOCR není ready, odlož
+        _eng = self.engine_combo.currentText() if hasattr(self, "engine_combo") else ""
+        _lang_raw = self.lang_combo.currentText() if hasattr(self, "lang_combo") else "ces"
+        if not self._handle_easyocr_guard_before_ocr(_eng, _lang_raw, {"mode": "incremental", "start_idx": start_idx}):
             return
         total_new = len(new_images)
         total_all = len(self.scanned_images)
@@ -1244,9 +1720,12 @@ class ScanApp(QWidget):
         self.ocr_thread.finished.connect(on_finished)
         if hasattr(self.ocr_thread, "diacritics_failed"):
             self.ocr_thread.diacritics_failed.connect(self._on_diacritics_failed)
+        if hasattr(self.ocr_thread, "failed"):
+            self.ocr_thread.failed.connect(self._on_easyocr_thread_failed)
         if base_engine == "EasyOCR":
             self.progress_dialog = QProgressDialog("Načítám EasyOCR model...", "Zrušit", 0, 0, self)
-            self.ocr_thread.model_loading.connect(self._on_model_loaded)
+            if hasattr(self.ocr_thread, "model_loading"):
+                self.ocr_thread.model_loading.connect(self._on_model_loaded)
         else:
             self.progress_dialog = QProgressDialog("Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self)
         self.ocr_thread.progress.connect(self._on_ocr_progress)
@@ -1256,6 +1735,12 @@ class ScanApp(QWidget):
         self.progress_dialog.cancel()
 
         if not new_results_holder:
+            # Pokud EasyOCR selhal kvůli chybě modelu, nehlásit jen prázdný výsledek
+            if base_engine == "EasyOCR":
+                easy_lang = LANG_MAP_EASYOCR.get(base_lang.split()[0].strip(), base_lang.split()[0].strip()[:2])
+                if is_easyocr_failed(easy_lang):
+                    speak("EasyOCR se nepodařilo připravit. Zkontrolujte připojení k internetu a zkuste to znovu.")
+                    return
             speak("OCR nových stránek neprodukovalo žádné výsledky.")
             return
         # Oprav číslování stránek v novém textu (thread čísluje od 1)
@@ -1324,13 +1809,29 @@ class ScanApp(QWidget):
         total = len(self.scanned_images)
         # Inkrementální OCR: pokud již máme OCR pro část stránek, zpracuj pouze nové
         if self.last_ocr_results and 0 < len(self.last_ocr_results) < total:
-            # Zachovej pořadí 1..N, přidej pouze chybějící N+1..total
+            # Guard se provede uvnitř _run_ocr_incremental
             self._run_ocr_incremental(len(self.last_ocr_results))
             return
         self._ocr_total_pages = total
         self._ocr_last_announced_page = 0
+        # Guard pro EasyOCR před zahájením flow
+        _eng = self.engine_combo.currentText() if hasattr(self, "engine_combo") else ""
+        _lang_raw = self.lang_combo.currentText() if hasattr(self, "lang_combo") else "ces"
+        if not self._handle_easyocr_guard_before_ocr(_eng, _lang_raw, {"mode": "full", "interactive": True}):
+            return
         speak(f"Zahajuji OCR {total} stránek.")
         self._run_ocr_flow(interactive=True)
+
+    def _on_easyocr_thread_failed(self, msg: str) -> None:
+        logger.error("EasyOCR thread failed: %s", msg)
+        # progress_dialog canceled handled in _ocr_finished / loop
+        speak("EasyOCR se nepodařilo připravit. Zkontrolujte připojení k internetu a zkuste to znovu.")
+        self._update_easyocr_status_label("failed", "EasyOCR se nepodařilo připravit.")
+        try:
+            if hasattr(self, "progress_dialog") and self.progress_dialog is not None:
+                self.progress_dialog.cancel()
+        except Exception:
+            pass
 
     def _start_ocr(
         self,
@@ -1347,6 +1848,8 @@ class ScanApp(QWidget):
         self.ocr_thread.ocr_results.connect(self._set_ocr_results)
         if hasattr(self.ocr_thread, "diacritics_failed"):
             self.ocr_thread.diacritics_failed.connect(self._on_diacritics_failed)
+        if hasattr(self.ocr_thread, "failed"):
+            self.ocr_thread.failed.connect(self._on_easyocr_thread_failed)
         if on_done:
             self.ocr_thread.finished.connect(on_done)
 
@@ -1354,7 +1857,8 @@ class ScanApp(QWidget):
             self.progress_dialog = QProgressDialog(
                 "Načítám EasyOCR model...", "Zrušit", 0, 0, self
             )
-            self.ocr_thread.model_loading.connect(self._on_model_loaded)
+            if hasattr(self.ocr_thread, "model_loading"):
+                self.ocr_thread.model_loading.connect(self._on_model_loaded)
         else:
             self.progress_dialog = QProgressDialog(
                 "Probíhá OCR (Tesseract)...", "Zrušit", 0, 100, self
@@ -1401,6 +1905,11 @@ class ScanApp(QWidget):
         """
         base_engine = self.engine_combo.currentText()
         base_lang = self.lang_combo.currentText()
+        # Guard znovu – pokud je EasyOCR a není ready, již jsme deferovali v run_ocr,
+        # ale pro přímé volání (pending save, retry) zkontroluj znovu
+        if base_engine == "EasyOCR":
+            if not self._handle_easyocr_guard_before_ocr(base_engine, base_lang, {"mode": "full", "interactive": interactive}):
+                return
         images = list(self.scanned_images)
         found = self._run_single_attempt(base_engine, base_lang, images)
 
@@ -2168,34 +2677,16 @@ class ScanApp(QWidget):
 
     def _save_pdf_with_ocr(self, path: str) -> None:
         """Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR. Použije self.last_ocr_results, nespouští OCR."""
-        doc = fitz.open()
         dpi = self.dpi_combo.currentData()
         if dpi is None:
             dpi = 300
-        for i, img in enumerate(self.scanned_images):
-            page = doc.new_page(width=img.width / dpi * 72, height=img.height / dpi * 72)
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-                    tmp_path = tmp.name
-                    img.save(tmp_path, "JPEG", quality=95)
-                page.insert_image(page.rect, filename=tmp_path)
-                if i < len(self.last_ocr_results):
-                    for item in self.last_ocr_results[i]:
-                        if item.bbox is not None:
-                            bbox = item.bbox
-                            x0, y0 = bbox[0][0], bbox[0][1]
-                            x1, y1 = bbox[2][0], bbox[2][1]
-                            rect = fitz.Rect(x0 / dpi * 72, y0 / dpi * 72, x1 / dpi * 72, y1 / dpi * 72)
-                            txt = item.display_text if hasattr(item, "display_text") else item.text
-                            page.insert_textbox(rect, txt, fontsize=0, fill_opacity=0)
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-        doc.save(path)
+        # Veškerá logika vrstvy je v testovatelné build_searchable_pdf().
+        # Záměrně nemění zdroj textu (last_ocr_results, ne ruční editace) –
+        # viz ticket: editace z OcrPreviewDialog je samostatný problém.
+        stats = build_searchable_pdf(list(self.scanned_images),
+                                     list(self.last_ocr_results),
+                                     int(dpi), path)
+        logger.info("PDF s OCR uloženo: %s stats=%s", path, stats)
         self._show_save_success(path, "PDF s rozpoznaným textem (.pdf)", "PDF s OCR")
 
     def _save_pdf(self, path: str) -> None:

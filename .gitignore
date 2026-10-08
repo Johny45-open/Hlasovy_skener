@@ -1,0 +1,7 @@
+# EasyOCR model cache – nestahovat do repozitáře
+.easyocr_model/
+*.pth
+*.zip
+easyocr_model/
+__pycache__/
+*.pyc
