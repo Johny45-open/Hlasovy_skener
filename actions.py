@@ -83,7 +83,19 @@ class SaveTxtAction(BaseAction):
     description = "Zeptá se na umístění a uloží rozpoznaný text jako textový soubor."
 
     def run(self, ctx: PipelineContext, app: ScanApp) -> None:
-        if not ctx.text:
+        # Potvrzené stránky mají přednost (stejná verze jako PDF/DOCX z GUI),
+        # jinak legacy text z kontextu makra.
+        confirmed_text: str | None = None
+        try:
+            if app.is_confirmation_valid():
+                pages = app.get_export_pages()
+                parts = [f"--- Stránka {i + 1} ---\n{(p or '').strip()}\n\n"
+                         for i, p in enumerate(pages)]
+                confirmed_text = "".join(parts)
+        except Exception:
+            confirmed_text = None
+        text = confirmed_text if confirmed_text else ctx.text
+        if not text:
             app.speak("Není žádný text k uložení.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -91,7 +103,7 @@ class SaveTxtAction(BaseAction):
         )
         if path:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(ctx.text)
+                f.write(text)
             app.speak("Text uložen.")
 
 

@@ -43,11 +43,16 @@ def _preserve_case(original: str, corrected: str) -> str:
 # ---------------------------------------------------------------------------
 # Slovník: stripped lower -> diacritized lower
 # Zdrojem je kurátorovaný seznam frekventovaných českých slov s diakritikou.
-# Každý klíč je unikátní (strip(correct)). Ambiguous tvary (byt/být) jsou
-# záměrně ponechány pouze s jednou variantou – bezpečné, nehádá kontextem.
+# Ambiguous tvary (byt/být) se NIKDY automaticky nemění – bez kontextu nelze
+# bezpečně rozhodnout. Jsou evidovány v _AMBIGUOUS_STRIPPED.
+# Modul je pouze doplňování diakritiky, nikoliv kontrola pravopisu.
 # ---------------------------------------------------------------------------
 
 # Seznam správných tvarů (lowercase). Z něj se automaticky odvodí stripped->correct.
+# BEZPEČNOST: pokud stripped forma odpovídá jinému platnému slovu (např. "byt"
+# je platné slovo i cíl "být"), mapování se NEVYTVOŘÍ – původní slovo se ponechá.
+# Automatická změna významu bez kontextu je zakázána. Kolizní klíče jsou
+# evidovány v _AMBIGUOUS_STRIPPED pro nabídku k ruční kontrole.
 _CORRECT_WORDS = [
     # příklady ze zadání
     "příliš", "žluťoučký", "kůň", "úpěl", "ďábelské", "ódy",
@@ -160,14 +165,30 @@ _CORRECT_WORDS = [
     "půda", "půl", "půjčit", "původ", "růže", "růst", "průběh", "průměr",
 ]
 
-# Sestavení slovníku stripped->correct (pouze kde se liší)
+# Sestavení slovníku stripped->correct (pouze kde se liší).
+# Množina všech platných slov pro detekci významových kolizí.
+_CORRECT_SET: set[str] = set(_w.lower() for _w in _CORRECT_WORDS)
+# Stripped klíče, u kterých nelze bezpečně rozhodnout (kolize významů).
+# Tato slova se nikdy automaticky nemění – nabídnou se k ruční kontrole.
+_AMBIGUOUS_STRIPPED: set[str] = set()
+
 _DIACRITICS_DICT: dict[str, str] = {}
 for _w in _CORRECT_WORDS:
     _key = strip_diacritics(_w.lower())
     _correct = _w.lower()
     if _key == _correct:
         continue
-    # pokud kolize (více slov mapuje na stejný stripped), ponech první – bezpečné
+    if _key in _DIACRITICS_DICT and _DIACRITICS_DICT[_key] != _correct:
+        # Kolize: více různých cílů pro stejný stripped tvar – nehádat.
+        _AMBIGUOUS_STRIPPED.add(_key)
+        del _DIACRITICS_DICT[_key]
+        continue
+    if _key in _AMBIGUOUS_STRIPPED:
+        continue
+    if _key in _CORRECT_SET:
+        # Stripped tvar je sám platným slovem (byt/být) – změna by měnila význam.
+        _AMBIGUOUS_STRIPPED.add(_key)
+        continue
     if _key not in _DIACRITICS_DICT:
         _DIACRITICS_DICT[_key] = _correct
 
@@ -202,6 +223,18 @@ _EXTRA_MAP = {
     "cisla": "čísla",
 }
 for _k, _v in _EXTRA_MAP.items():
+    if _k in _AMBIGUOUS_STRIPPED:
+        continue
+    if _k in _CORRECT_SET and _k != _v.lower():
+        # Ruční mapa by měnila platné slovo na jiné – zakázáno.
+        _AMBIGUOUS_STRIPPED.add(_k)
+        _DIACRITICS_DICT.pop(_k, None)
+        continue
+    _existing = _DIACRITICS_DICT.get(_k)
+    if _existing is not None and _existing != _v.lower():
+        _AMBIGUOUS_STRIPPED.add(_k)
+        _DIACRITICS_DICT.pop(_k, None)
+        continue
     _DIACRITICS_DICT[_k] = _v
 
 # Tokenizace: slovo (včetně čísel) vs. mezery vs. interpunkce
@@ -233,6 +266,10 @@ def _diacritize_word(word: str) -> str:
         if not word.isalpha():
             return word
     key = strip_diacritics(word.lower())
+    # Slovo, které je samo platným tvarem, se nikdy nemění na jiné platné
+    # slovo (obrana proti významovým změnám typu byt → být).
+    if word.lower() in _CORRECT_SET:
+        return word
     # pokud slovo už obsahuje diakritiku a zároveň jeho stripped forma není ve slovníku,
     # ponech beze změny (neznámé slovo – bezpečné)
     correct_lower = _DIACRITICS_DICT.get(key)

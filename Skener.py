@@ -76,6 +76,10 @@ _OCR_PDF_BUNDLED_FONT = os.path.join(
 _OCR_PDF_MIN_FONTSIZE = 4.0
 _OCR_PDF_MAX_START_FONTSIZE = 12.0
 _OCR_PDF_SHRINK_FACTOR = 0.9
+# Samostatná explicitní cesta pro celou potvrzenou vrstvu změněné stránky:
+# plná dostupná plocha s okraji (nikoliv úzký spodní pruh fallbacku).
+_OCR_PDF_CONFIRMED_MARGIN = 36.0
+_OCR_PDF_CONFIRMED_START_FONTSIZE = 11.0
 
 
 def _resolve_ocr_pdf_fontfile() -> Optional[str]:
@@ -163,15 +167,67 @@ def _insert_ocr_textbox_invisible(page: "fitz.Page", rect: "fitz.Rect",
         return "failed"
 
 
+def _insert_confirmed_page_layer(page: "fitz.Page", text: str,
+                                     fontname: str) -> str:
+    """Vloží celou potvrzenou textovou vrstvu přes dostupnou plochu stránky.
+
+    Samostatná explicitní cesta pro změněné stránky – nepoužívá bbox=None
+    fallback do spodního pruhu. Vrací 'ok' | 'shrunk' | 'failed'.
+    'failed' znamená, že se text nevešel ani při minimální velikosti písma;
+    volající pak export přeruší (žádné potiché ořezání, žádný text mimo stránku).
+    Prázdný text vrstvu nevytváří (obraz zůstává), vrací 'ok'.
+    """
+    if not text or not str(text).strip():
+        return "ok"
+    text = str(text)
+    margin = _OCR_PDF_CONFIRMED_MARGIN
+    try:
+        w, h = float(page.rect.width), float(page.rect.height)
+    except Exception:
+        return "failed"
+    if w <= 2 * margin or h <= 2 * margin:
+        # Velmi malá stránka – zmenši okraje, ale nikdy ne mimo stránku.
+        margin = max(4.0, min(w, h) / 8.0)
+        if w <= 2 * margin or h <= 2 * margin:
+            return "failed"
+    rect = fitz.Rect(margin, margin, w - margin, h - margin)
+    fs = _OCR_PDF_CONFIRMED_START_FONTSIZE
+    shrunk = False
+    while True:
+        try:
+            ret = page.insert_textbox(rect, text, fontsize=fs,
+                                      fontname=fontname, render_mode=3)
+        except Exception as e:
+            logger.warning("Potvrzená PDF vrstva insert_textbox selhal (fs=%.2f): %s", fs, e)
+            ret = -1.0
+        if ret is not None and ret >= 0:
+            return "shrunk" if shrunk else "ok"
+        next_fs = max(_OCR_PDF_MIN_FONTSIZE, fs * _OCR_PDF_SHRINK_FACTOR)
+        if next_fs >= fs:
+            logger.error("Potvrzená PDF vrstva: text se nevešel ani při fs=%.2f.", fs)
+            return "failed"
+        fs = next_fs
+        shrunk = True
+
+
 def build_searchable_pdf(images: list[Image.Image],
-                          ocr_pages: list[list],
-                          dpi: int,
-                          output_path: str) -> dict:
+                           ocr_pages: list[list],
+                           dpi: int,
+                           output_path: str,
+                           confirmed_override: list | None = None) -> dict:
     """Sestaví prohledávatelné PDF: obraz + neviditelná Unicode vrstva.
 
     Testovatelná bez Qt. Zachovává převod px->pt (x/dpi*72) i konzistenci
     OCR-obraz vs. PDF-obraz (volající předává stejné objekty).
-    Statistiky: {pages, inserted, shrunk, fallback, failed, nobbox}.
+    Statistiky: {pages, inserted, shrunk, fallback, failed, nobbox, confirmed}.
+
+    confirmed_override: volitelný per-page přepis (stejná délka jako images).
+    Prvek None = nezměněná stránka (původní word-level vrstva).
+    Prvek str = změněná stránka: použije se VÝHRADNĚ explicitní potvrzená
+    vrstva přes celou plochu stránky, staré OCR položky se nevkládají
+    (žádná duplicita). Nevejde-li se text ani při minimální velikosti,
+    export se přeruší výjimkou RuntimeError a PDF nevznikne (žádné
+    neúplné PDF, žádný text mimo stránku).
     """
     if dpi is None or int(dpi) <= 0:
         dpi = 300
@@ -185,7 +241,12 @@ def build_searchable_pdf(images: list[Image.Image],
             "(assets/fonts/DejaVuSans.ttf). Přeinstalujte aplikaci."
         )
     stats = {"pages": 0, "inserted": 0, "shrunk": 0,
-             "fallback": 0, "failed": 0, "nobbox": 0}
+              "fallback": 0, "failed": 0, "nobbox": 0, "confirmed": 0}
+    if confirmed_override is not None and len(confirmed_override) != len(images):
+        raise ValueError(
+            "confirmed_override musí mít stejný počet stránek jako images "
+            f"({len(confirmed_override)} != {len(images)})."
+        )
     doc = fitz.open()
     try:
         for i, img in enumerate(images):
@@ -209,6 +270,26 @@ def build_searchable_pdf(images: list[Image.Image],
                 logger.error("OCR PDF: registrace fontu selhala: %s", e)
                 raise RuntimeError(f"Registrace Unicode fontu selhala: {e}")
             stats["pages"] += 1
+            # Změněná stránka: výhradně potvrzená vrstva, staré položky se
+            # nevkládají (jinak by vznikla duplicita starý+nový text).
+            if confirmed_override is not None and confirmed_override[i] is not None:
+                confirmed_text = confirmed_override[i]
+                if confirmed_text and str(confirmed_text).strip():
+                    res = _insert_confirmed_page_layer(
+                        page, confirmed_text, _OCR_PDF_FONTNAME)
+                    if res in ("ok", "shrunk"):
+                        stats["inserted"] += 1
+                        stats["confirmed"] += 1
+                    if res == "shrunk":
+                        stats["shrunk"] += 1
+                    elif res == "failed":
+                        stats["failed"] += 1
+                        raise RuntimeError(
+                            f"Potvrzený text stránky {i + 1} se nevešel do textové "
+                            f"vrstvy ani při minimální velikosti písma. "
+                            f"PDF nebylo vytvořeno."
+                        )
+                continue
             nobbox_texts: list[str] = []
             if i < len(ocr_pages):
                 for item in ocr_pages[i]:
@@ -429,6 +510,122 @@ def _split_text_by_page_headers(text: str) -> list[str] | None:
         # strip jen koncové \n, pak strip surrounding whitespace per page
         pages.append(page_content.strip())
     return pages
+
+
+# ------------------ Potvrzený text po stránkách (jediný zdroj pro export) ------------------
+def _normalize_page_text(text: str) -> str:
+    """Normalizace pro porovnání potvrzené vs. OCR verze (whitespace-insensitive)."""
+    return " ".join((text or "").split())
+
+
+def parse_confirmed_pages_strict(text: str, total: int) -> list[str] | None:
+    """Striktně ověří strukturu kontrolovaného textu a vrátí obsah per-page.
+
+    Bezpečný směr: pokud nelze jednoznačně určit obsah každé původní stránky,
+    vrátí None (volající export zastaví a nabídne opravu/zrušení).
+    Nikdy nepřesouvá obsah mezi stránkami ani nic nezahazuje.
+
+    Pravidla:
+    - total <= 0 → None.
+    - total == 1: bez headerů je celou stránkou celý text; s headery musí být
+      právě jeden číslovaný 1 a před ním nesmí být žádný text.
+    - total > 1: vyžaduje přesně total headerů číslovaných 1..total v pořadí,
+      před prvním headerem nesmí být žádný text.
+    """
+    if total is None or total <= 0:
+        return None
+    if text is None:
+        return None
+    matches = list(_PAGE_HEADER_RE.finditer(text))
+    if total == 1:
+        if not matches:
+            return [text.strip()]
+        if len(matches) != 1:
+            return None
+        try:
+            num = int(matches[0].group(1))
+        except (ValueError, IndexError):
+            return None
+        if num != 1:
+            return None
+        if text[:matches[0].start()].strip():
+            return None
+        return [text[matches[0].end():].strip()]
+    # total > 1
+    if len(matches) != total:
+        return None
+    for idx, m in enumerate(matches):
+        try:
+            num = int(m.group(1))
+        except (ValueError, IndexError):
+            return None
+        if num != idx + 1:
+            return None
+    if text[:matches[0].start()].strip():
+        return None
+    pages: list[str] = []
+    for idx, m in enumerate(matches):
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        pages.append(text[start:end].strip())
+    return pages
+
+
+def _reconstruct_ocr_page_text(page_items) -> str:
+    """Poskládá text jedné stránky z OcrResult (display_text), bez Qt."""
+    parts: list[str] = []
+    for item in page_items or []:
+        txt = getattr(item, "display_text", None)
+        if txt is None:
+            txt = getattr(item, "text", "")
+        if callable(txt):
+            try:
+                txt = txt()
+            except Exception:
+                txt = ""
+        if txt is None:
+            continue
+        parts.append(str(txt))
+    return "\n".join(parts)
+
+
+def build_confirmed_pdf_plan(
+    ocr_pages: list[list],
+    confirmed_pages: list[str] | None,
+    total: int,
+) -> tuple[list, list[bool]]:
+    """Rozhodne per-page: word-level vrstva vs. explicitní potvrzená vrstva.
+
+    Vrací (override, changed): override[i] je potvrzený text změněné stránky,
+    jinak None (= použít původní word-level položky). changed[i] je True pouze
+    pro stránky, jejichž potvrzený text se (po normalizaci) liší od OCR verze.
+
+    confirmed_pages musí mít délku total, jinak se vše považuje za nezměněné
+    (legacy chování beze změny vrstvy).
+    """
+    override: list = []
+    changed: list[bool] = []
+    valid = (
+        confirmed_pages is not None
+        and total
+        and len(confirmed_pages) == total
+    )
+    for i in range(total or 0):
+        if not valid:
+            override.append(None)
+            changed.append(False)
+            continue
+        confirmed = confirmed_pages[i] or ""
+        orig_items = ocr_pages[i] if i < len(ocr_pages) else []
+        if _normalize_page_text(confirmed) == _normalize_page_text(
+            _reconstruct_ocr_page_text(orig_items)
+        ):
+            override.append(None)
+            changed.append(False)
+        else:
+            override.append(confirmed)
+            changed.append(True)
+    return override, changed
 
 
 # ------------------ Dialog pro výběr formátu uložení (legacy) ------------------
@@ -820,6 +1017,14 @@ class ScanApp(QWidget):
         self._ocr_last_announced_page: int = 0
         # Pro dvoustupňové ukládání – zachování volby přes OCR
         self._pending_save_format: str | None = None
+        # Jediný potvrzený zdroj textu po stránkách (společný pro PDF/TXT/DOCX/makra).
+        # Nastavuje se výhradně potvrzením v OcrPreviewDialog, ruší se každou
+        # změnou, která potvrzení zneplatňuje (nové OCR, retry, přidání/smazání
+        # stránky). _ocr_rev se zvyšuje každým dokončeným OCR, _confirmed_rev
+        # zachycuje revizi, pro kterou potvrzení platí.
+        self._confirmed_pages: list[str] | None = None
+        self._ocr_rev: int = 0
+        self._confirmed_rev: int = -1
 
         self.macro_manager = MacroManager()
         self.macro_manager.load_all()
@@ -1473,6 +1678,7 @@ class ScanApp(QWidget):
             self.raw_scanned_images.clear()
             self.page_list.clear()
             self.last_ocr_results.clear()
+            self._invalidate_confirmation()
             self._last_text = ""
             self._last_original_text = ""
             self._last_edited_pages = None
@@ -1483,6 +1689,7 @@ class ScanApp(QWidget):
         else:
             # No pages – ensure clean state (in case of residual OCR results)
             self.last_ocr_results.clear()
+            self._invalidate_confirmation()
             self._last_text = ""
             self._last_original_text = ""
             self._last_edited_pages = None
@@ -1550,6 +1757,8 @@ class ScanApp(QWidget):
             return
 
         # _scan_finished already appended images; now update page_list incrementally
+        # Nová stránka bez OCR zneplatňuje předchozí potvrzení textu.
+        self._invalidate_confirmation()
         new_num = len(self.scanned_images)
         # Guard against double-add if scan_pages bulk path was used – but scan_next_page
         # never clears, so page_list should have count_before items
@@ -1704,6 +1913,7 @@ class ScanApp(QWidget):
         self.page_list.takeItem(row)
         del self.scanned_images[row]
         del self.raw_scanned_images[row]
+        self._invalidate_confirmation()
         if self.last_ocr_results and row < len(self.last_ocr_results):
             del self.last_ocr_results[row]
         if self._last_edited_pages is not None and row < len(self._last_edited_pages):
@@ -1760,6 +1970,7 @@ class ScanApp(QWidget):
         self.scanned_images.clear()
         self.raw_scanned_images.clear()
         self.last_ocr_results.clear()
+        self._invalidate_confirmation()
         self._last_text = ""
         self._last_original_text = ""
         self._last_edited_pages = None
@@ -1817,6 +2028,8 @@ class ScanApp(QWidget):
         new_images = self.scanned_images[start_idx:]
         if not new_images:
             return
+        # Doplnění OCR zneplatňuje předchozí potvrzení textu.
+        self._invalidate_confirmation()
         # Guard – pokud EasyOCR není ready, odlož
         _eng = self.engine_combo.currentText() if hasattr(self, "engine_combo") else ""
         _lang_raw = self.lang_combo.currentText() if hasattr(self, "lang_combo") else "ces"
@@ -1896,6 +2109,7 @@ class ScanApp(QWidget):
 
         # Merge
         self.last_ocr_results = old_results + new_results_holder
+        self._ocr_rev += 1
         # Pokud byl původní full_text s headery, připoj nové; jinak použij corrected
         # Pro zachování přesnosti použij starý text + corrected_new_text
         if old_text and old_text.strip():
@@ -1929,7 +2143,7 @@ class ScanApp(QWidget):
         if self._diacritics_failed and diac_active:
             speak("OCR dokončeno. Oprava české diakritiky se nepodařila. Byl zachován původní text.")
         elif diac_active:
-            speak("OCR dokončeno a česká diakritika opravena.")
+            speak(f"OCR dokončeno pro {total_all} stránek. Kontrola diakritiky dokončena.")
         else:
             speak(f"OCR dokončeno pro {total_all} stránek.")
 
@@ -1977,6 +2191,8 @@ class ScanApp(QWidget):
         engine: str,
         on_done: Optional[Callable[[], None]] = None,
     ) -> None:
+        # Nové OCR zneplatňuje předchozí potvrzení textu.
+        self._invalidate_confirmation()
         diac_enabled = self.diacritics_cb.isChecked() if hasattr(self, "diacritics_cb") else False
         self._diacritics_failed = False
         self._diacritics_enabled_cache = diac_enabled
@@ -2121,6 +2337,7 @@ class ScanApp(QWidget):
         new_images = self.scanned_images[start_idx:]
         if not new_images:
             return
+        self._invalidate_confirmation()
         base_engine = self.engine_combo.currentText()
         alt_engine = self._get_alternate_engine(base_engine)
         lang = self.lang_combo.currentText()
@@ -2192,8 +2409,9 @@ class ScanApp(QWidget):
             self._ocr_last_announced_page = prev_announced
             QMessageBox.warning(self, "OCR bez výsledku", f"Pokus s {alt_engine} pro nové stránky neprodukoval text. Původní výsledek zachován.")
             speak("Nový pokus selhal, původní výsledek zachován.")
-            # Zobrazit původní náhled pokud existoval
-            if backup_text and backup_text.strip():
+            # Zobrazit původní náhled pokud existoval – ale ne během ukládání
+            # (tam kontrolu řídí save-smyčka, která dialog znovu otevře sama).
+            if backup_text and backup_text.strip() and not getattr(self, "_pending_save_format", None):
                 self._show_ocr_preview(self._last_text, is_incremental=True, incremental_start_idx=start_idx)
             return
         # Úspěch – merge stejně jako v _run_ocr_incremental
@@ -2210,6 +2428,7 @@ class ScanApp(QWidget):
             corrected_new_text += f"--- Stránka {page_num} ---\n{page_text}\n\n"
         # Merge results
         self.last_ocr_results = old_results + new_results_holder
+        self._ocr_rev += 1
         # Merge text
         old_text_for_merge = backup_text if backup_text else ""
         # Pokud starý text existoval, připoj nové; jinak použij corrected
@@ -2309,6 +2528,7 @@ class ScanApp(QWidget):
     def _ocr_finished(self, full_text: str) -> None:
         self.progress_dialog.cancel()
         self._last_text = full_text
+        self._ocr_rev += 1
         # Inicializuj per-page z full_text
         try:
             pages = _split_text_by_page_headers(full_text)
@@ -2340,9 +2560,10 @@ class ScanApp(QWidget):
         if self._diacritics_failed and diac_active:
             speak("OCR dokončeno. Oprava české diakritiky se nepodařila. Byl zachován původní text.")
         elif diac_active:
-            speak("OCR dokončeno a česká diakritika opravena.")
             if total:
-                speak(f"OCR dokončeno pro {total} stránek.")
+                speak(f"OCR dokončeno pro {total} stránek. Kontrola diakritiky dokončena.")
+            else:
+                speak("OCR dokončeno. Kontrola diakritiky dokončena.")
         else:
             if total:
                 speak(f"OCR dokončeno pro {total} stránek.")
@@ -2351,6 +2572,99 @@ class ScanApp(QWidget):
             return
         if self._ocr_mode == "interactive":
             self._show_ocr_preview(full_text)
+
+    # ---------- Potvrzený text – stav a helpery ----------
+    def _invalidate_confirmation(self) -> None:
+        """Zruší potvrzení textu (nové OCR, retry, změna stránek)."""
+        self._confirmed_pages = None
+        self._confirmed_rev = -1
+
+    def _confirm_pages(self, pages: list[str], full_text: str) -> None:
+        """Uloží uživatelem potvrzený text jako jediný zdroj pro export."""
+        self._confirmed_pages = list(pages)
+        self._confirmed_rev = self._ocr_rev
+        self._last_edited_pages = list(pages)
+        self._last_text = full_text
+
+    def is_confirmation_valid(self) -> bool:
+        """True pokud potvrzení platí pro aktuální stránky i OCR revizi."""
+        total = len(self.scanned_images)
+        return (
+            self._confirmed_pages is not None
+            and total > 0
+            and len(self._confirmed_pages) == total
+            and self._confirmed_rev == self._ocr_rev
+        )
+
+    def get_export_pages(self) -> list[str]:
+        """Vrátí stránky pro export TXT/DOCX/maker: potvrzené, jinak legacy fallback."""
+        if self.is_confirmation_valid():
+            return list(self._confirmed_pages)
+        return self._get_docx_pages()
+
+    def _ask_confirmed_pages_invalid(self, total: int) -> bool:
+        """Text nelze bezpečně rozdělit na stránky. Vrátí True pro opravu, False pro zrušení."""
+        speak("Text nelze bezpečně rozdělit na stránky.")
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Nelze určit stránky")
+        msg.setText(
+            f"Text nelze bezpečně rozdělit na {total} stránek. "
+            f"Zkontrolujte značky „--- Stránka N ---“ (číslování 1 až {total} v pořadí)."
+        )
+        msg.setInformativeText("Žádný text se nezahazuje. Můžete se vrátit k opravě, nebo ukládání zrušit.")
+        btn_fix = msg.addButton("Opravit text", QMessageBox.ButtonRole.YesRole)
+        btn_fix.setAccessibleName("Opravit text a vrátit se ke kontrole")
+        btn_cancel = msg.addButton("Zrušit ukládání", QMessageBox.ButtonRole.NoRole)
+        btn_cancel.setAccessibleName("Zrušit ukládání")
+        msg.setDefaultButton(btn_fix)
+        msg.exec()
+        return msg.clickedButton() == btn_fix
+
+    def _review_confirmed_text(
+        self,
+        initial_text: str,
+        total: int,
+        *,
+        context_label: str,
+        scope: str = "full",
+        scope_start: int = 0,
+    ) -> list[str] | None:
+        """Kontrola textu před uložením (znovu využívá OcrPreviewDialog).
+
+        Potvrzení dialogu je jediná cesta k uložení nové nepotvrzené verze.
+        Vrací potvrzené stránky, nebo None při zrušení (export se pak nesmí
+        provést). Opakování jiným enginem vede k nové kontrole, ne k uložení.
+        """
+        current_text = initial_text
+        while True:
+            alt = self._get_alternate_engine(self.engine_combo.currentText()) if hasattr(self, "engine_combo") else ""
+            dlg = OcrPreviewDialog(current_text, self, alt_engine_name=alt)
+            dlg.setWindowTitle(f"Kontrola textu před uložením – {context_label}")
+            dlg.text_edit.setAccessibleName("Rozpoznaný text ke kontrole a úpravě")
+            dlg.text_edit.setAccessibleDescription(
+                f"Zkontrolujte rozpoznaný text, celkem {total} stránek. "
+                f"Po potvrzení se uloží {context_label}.")
+            res = dlg.exec()
+            if res == OcrPreviewDialog.RESULT_RETRY:
+                # Jednorázový pokus druhým enginem ve stejném rozsahu,
+                # pak znovu kontrola (nikoliv automatické uložení).
+                if scope == "incremental":
+                    self._retry_incremental_with_alternate_engine(scope_start)
+                else:
+                    self._retry_with_alternate_engine(interactive=True)
+                current_text = self._last_text
+                continue
+            if res != QDialog.DialogCode.Accepted:
+                return None
+            edited = dlg.get_text()
+            pages = parse_confirmed_pages_strict(edited, total)
+            if pages is None:
+                if self._ask_confirmed_pages_invalid(total):
+                    current_text = edited
+                    continue
+                return None
+            self._confirm_pages(pages, edited)
+            return pages
 
     def _show_ocr_preview(self, full_text: str, is_incremental: bool = False, incremental_start_idx: int = 0) -> None:
         """Zobrazí náhled OCR textu k editaci – SAMOSTATNÝ krok OCR, bez ukládání.
@@ -2361,6 +2675,8 @@ class ScanApp(QWidget):
         speak("Zobrazuji náhled rozpoznaného textu. Můžete jej upravit nebo přečíst. Uložení provedete tlačítkem Uložit dokument.")
         alt_engine = self._get_alternate_engine(self.engine_combo.currentText()) if hasattr(self, "engine_combo") else ""
         dialog = OcrPreviewDialog(full_text, self, alt_engine_name=alt_engine)
+        dialog.text_edit.setAccessibleDescription(
+            f"Rozpoznaný text k úpravě, celkem {len(self.scanned_images)} stránek.")
         result = dialog.exec()
         if result == OcrPreviewDialog.RESULT_RETRY:
             # Explicitní žádost – jednorázový pokus druhým enginem, původní výsledek zachován do úspěchu
@@ -2373,22 +2689,22 @@ class ScanApp(QWidget):
             self.btn_read.setFocus()
             return
         edited_text = dialog.get_text()
-        self._last_text = edited_text
-        try:
-            pages = _split_text_by_page_headers(edited_text)
-            if pages is not None:
-                self._last_edited_pages = pages
-            else:
-                if len(self.scanned_images) == 1:
-                    self._last_edited_pages = [edited_text]
-                else:
-                    self._last_edited_pages = None
-        except Exception:
+        pages = parse_confirmed_pages_strict(edited_text, len(self.scanned_images))
+        if pages is not None:
+            self._confirm_pages(pages, edited_text)
+        else:
+            # Strukturu stránek nelze bezpečně určit – nic se nepotvrzuje,
+            # text se zachová a kontrola před uložením nabídne opravu.
+            self._invalidate_confirmation()
+            self._last_text = edited_text
             self._last_edited_pages = None
         # Po náhledu nabídni uložení přes samostatné tlačítko, ale ne automaticky
         # (uživatel stiskne Uložit dokument)
         self.btn_save_document.setFocus()
-        speak("Náhled uložen. Pro uložení stiskněte Uložit dokument.")
+        if pages is not None:
+            speak("Náhled uložen. Pro uložení stiskněte Uložit dokument.")
+        else:
+            speak("Náhled uložen, ale text se nepodařilo rozdělit na stránky. Při ukládání budete vyzváni k opravě.")
 
     def _ocr_show_save_ui(self, full_text: str) -> None:
         """Legacy wrapper – zachován pro makra. Nově jen zobrazí náhled bez auto-uložení."""
@@ -2461,6 +2777,20 @@ class ScanApp(QWidget):
         is_complete = self._is_ocr_complete()
         # fmt: txt, docx, pdf_ocr
         if is_complete:
+            if self.is_confirmation_valid():
+                # Opakované uložení nezměněných dat – bez nové kontroly.
+                self._do_save_ocr_format(fmt)
+                self._pending_save_format = None
+                return
+            # Nová nepotvrzená verze: jediná cesta k uložení je kontrolní dialog.
+            fmt_human = {"txt": "TXT", "docx": "DOCX", "pdf_ocr": "PDF s OCR"}[fmt]
+            pages = self._review_confirmed_text(
+                self._last_text, total, context_label=f"{fmt_human}, {total} stránek")
+            if pages is None:
+                self._pending_save_format = None
+                speak("Ukládání zrušeno.")
+                self.page_list.setFocus()
+                return
             self._do_save_ocr_format(fmt)
             self._pending_save_format = None
             return
@@ -2545,9 +2875,11 @@ class ScanApp(QWidget):
         return "cancel"
 
     def _run_ocr_for_pending_save(self, fmt: str) -> None:
-        """Spustí OCR explicitně a po úspěchu automaticky uloží pending formát."""
+        """Spustí OCR explicitně, pak zobrazí kontrolu a po potvrzení uloží pending formát."""
         # zachovej fmt v self._pending_save_format (už nastaveno)
         total_before = len(self.scanned_images)
+        scope = "full"
+        scope_start = 0
         try:
             if self._is_ocr_empty():
                 # full OCR
@@ -2556,10 +2888,11 @@ class ScanApp(QWidget):
                 speak(f"Spouštím OCR pro uložení {fmt}, celkem {total_before} stránek.")
                 self._run_ocr_flow(interactive=False)
                 # _run_ocr_flow v non-interactive neukazuje preview, ale nastaví _last_text
-                # pokud našlo text, pokračuj k uložení
             else:
                 # incremental – doplnit chybějící
                 missing_start = len(self.last_ocr_results)
+                scope = "incremental"
+                scope_start = missing_start
                 self._run_ocr_incremental(missing_start)
                 # _run_ocr_incremental už vrací pokud pending, bez preview
         except Exception as e:
@@ -2572,6 +2905,18 @@ class ScanApp(QWidget):
             QMessageBox.warning(self, "OCR bez výsledku", "OCR bylo dokončeno, ale nebyl rozpoznán žádný text. Dokument nebude uložen.")
             speak("OCR neprodukovalo text.")
             self._pending_save_format = None
+            return
+        # Kontrola textu před dokončením exportu – povinná, zrušení zastaví uložení.
+        fmt_human = {"txt": "TXT", "docx": "DOCX", "pdf_ocr": "PDF s OCR"}[fmt]
+        total = len(self.scanned_images)
+        pages = self._review_confirmed_text(
+            self._last_text, total,
+            context_label=f"{fmt_human}, {total} stránek",
+            scope=scope, scope_start=scope_start)
+        if pages is None:
+            speak("Ukládání zrušeno.")
+            self._pending_save_format = None
+            self.page_list.setFocus()
             return
         # Automaticky pokračovat v původně zvoleném ukládání
         try:
@@ -2613,8 +2958,7 @@ class ScanApp(QWidget):
             elif fmt == "docx":
                 self._save_docx_pages(path)
             else:
-                # pro TXT použij _last_text (již obsahuje headery)
-                self._save_txt_pages(path, self._last_text)
+                self._save_txt_pages(path)
         except Exception as e:
             QMessageBox.critical(self, "Chyba při ukládání", f"Nepodařilo se uložit soubor:\n{e}")
             speak("Chyba při ukládání souboru.")
@@ -2915,62 +3259,26 @@ class ScanApp(QWidget):
             return [self._last_text]
         return [""] * total if total else []
 
-    def _save_txt_pages(self, path: str, edited_text: str) -> None:
-        """Uloží TXT s oddělovači --- Stránka N --- v pořadí 1..N, čitelné pro NVDA."""
+    def _save_txt_pages(self, path: str) -> None:
+        """Uloží TXT s oddělovači --- Stránka N --- v pořadí 1..N, čitelné pro NVDA.
+
+        Zdroj je vždy get_export_pages() (potvrzené stránky, jinak legacy
+        fallback) – stejná verze jako DOCX/PDF. Nikdy se neuměle dělí text
+        ani nepřesouvá obsah mezi stránkami.
+        """
+        pages = self.get_export_pages()
         total = len(self.scanned_images)
-        # Pokud edited_text již obsahuje headery a počet sedí nebo je alespoň 1, ulož přímo
-        pages = _split_text_by_page_headers(edited_text)
-        if pages is not None and len(pages) == total:
-            # Obsah již má správné headery – ulož edited_text přímo (zachová přesnou editaci)
-            # Ale normalizuj aby každý header byl přesně "--- Stránka N ---"
-            # Pro jednoduchost ulož přímo edited_text pokud obsahuje headery
-            content = edited_text
-            # Zajisti, že soubor končí newline
-            if not content.endswith("\n"):
-                content += "\n"
-        elif total > 0:
-            # Generuj per-page z edited_text per-page pokud sedí, jinak fallback na edited split nebo OCR
-            if pages is not None and len(pages) == total:
-                content = ""
-                for i, p in enumerate(pages):
-                    content += f"--- Stránka {i+1} ---\n{p}\n\n"
-            elif self._last_edited_pages is not None and len(self._last_edited_pages) == total:
-                content = ""
-                for i, p in enumerate(self._last_edited_pages):
-                    content += f"--- Stránka {i+1} ---\n{p}\n\n"
-            else:
-                # Pokud edited_text nemá headery ale máme total, zkusit rozdělitEdited nebo použít celý edited_text jako stránku 1 + prázdné?
-                # Nejbezpečnější: pokud edited_text neobsahuje headery a je jen jeden dokument,
-                # ulož ho jako souvislý text s headery podle skutečných stránek.
-                # Pokud edited_text obsahuje více odstavců ale bez headerů, nelze bezpečně rekonstruovat per-page,
-                # takže pokud total==1 ulož přímo, jinak vygeneruj z OCR nebo z edited_text jako celek pro stránku 1.
-                if total == 1:
-                    # Pokud jedna stránka, bez headeru je ok, ale pro konzistenci přidej header
-                    # Pokud uživatel explicitně smazal header, respektuj jeho editaci – ulož bez headeru
-                    # Detekce: pokud edited_text nemá header a total==1, ulož edited_text přímo
-                    content = edited_text
-                else:
-                    # Více stránek ale text bez headerů – pokus se generovat z OCR per-page pokud dostupné
-                    if self.last_ocr_results and len(self.last_ocr_results) == total:
-                        # Pokud je edited_text výrazně odlišný od OCR, může být uživatelská editace
-                        # – v tom případě bez spolehlivého per-page rozdělení je bezpečnější uložit
-                        # edited_text jako celek bez umělého dělení.
-                        # Preferuj edited_text jako celek pro TXT čitelnost, ale zachovej informaci o stránkách:
-                        # Zkusíme: pokud edited_text obsahuje "\n\n" ale ne headery, uložíme ho s headery pouze pro první stránku?
-                        # Ne – specifikace říká TXT může obsahovat souvislý text všech stránek s oddělovači.
-                        # Pokud nemáme per-page, použij OCR per-page jako zdroj a ignoruj edited? To by zahodilo editaci.
-                        # Proto: ulož edited_text jako souvislý text s fallback generováním oddělovačů jen pokud edited_text je per-page.
-                        # Aktuálně: edited_text bez headerů pro více stran → ulož edited_text přímo (bez umělého dělení) + přidej info?
-                        # Rozhodnutí: ulož edited_text přímo, protože umělé dělení by bylo nebezpečné.
-                        # Ale pro konzistenci a NVDA čitelnost je lepší mít headery. Pokud edited_text nemá headery,
-                        # vytvoř per-page z OCR a nepoužívej edited – dokument by ztratil editaci. To je horší.
-                        # Kompromis: pokud edited_text bez headerů a total>1, ulož s headery kde stránka 1 = edited_text, ostatní prázdné?
-                        # Ne, to je matoucí. Nejmenší překvapení: ulož edited_text přímo.
-                        content = edited_text
-                    else:
-                        content = edited_text
+        if total <= 0:
+            content = ""
         else:
-            content = edited_text
+            # get_export_pages garantuje délku total (potvrzené) nebo legacy
+            # fallback; pro jistotu doplň/zkrát bez zahazování obsahu.
+            fixed = list(pages[:total])
+            while len(fixed) < total:
+                fixed.append("")
+            content = ""
+            for i, p in enumerate(fixed):
+                content += f"--- Stránka {i + 1} ---\n{(p or '').strip()}\n\n"
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -3000,16 +3308,21 @@ class ScanApp(QWidget):
         self._show_save_success(path, "PDF – naskenované stránky (.pdf)", "PDF bez OCR")
 
     def _save_pdf_with_ocr(self, path: str) -> None:
-        """Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR. Použije self.last_ocr_results, nespouští OCR."""
+        """Zachová vzhled naskenovaných stránek a přidá textovou vrstvu z OCR. Nespouští OCR."""
         dpi = self.dpi_combo.currentData()
         if dpi is None:
             dpi = 300
         # Veškerá logika vrstvy je v testovatelné build_searchable_pdf().
-        # Záměrně nemění zdroj textu (last_ocr_results, ne ruční editace) –
-        # viz ticket: editace z OcrPreviewDialog je samostatný problém.
+        # Zdroj textu: potvrzené stránky (je-li potvrzení platné), jinak
+        # původní last_ocr_results. Změněné stránky používají výhradně
+        # potvrzenou vrstvu (žádná duplicita starého textu).
+        confirmed = self._confirmed_pages if self.is_confirmation_valid() else None
+        override, _changed = build_confirmed_pdf_plan(
+            list(self.last_ocr_results), confirmed, len(self.scanned_images))
         stats = build_searchable_pdf(list(self.scanned_images),
                                      list(self.last_ocr_results),
-                                     int(dpi), path)
+                                     int(dpi), path,
+                                     confirmed_override=override)
         logger.info("PDF s OCR uloženo: %s stats=%s", path, stats)
         self._show_save_success(path, "PDF s rozpoznaným textem (.pdf)", "PDF s OCR")
 
@@ -3027,7 +3340,9 @@ class ScanApp(QWidget):
 
     def _save_docx(self, text: str, path: str) -> None:
         """Legacy wrapper – zachován pro kompatibilitu (makra). Nově volá per-page logiku."""
-        # Aktualizuj _last_text a _last_edited_pages pro per-page logiku
+        # Makro dodává vlastní text mimo kontrolní dialog – předchozí potvrzení
+        # se tím zneplatňuje (uloží se dodaný text, ne potvrzená verze).
+        self._invalidate_confirmation()
         self._last_text = text
         pages = _split_text_by_page_headers(text)
         if pages is not None:
@@ -3037,7 +3352,7 @@ class ScanApp(QWidget):
     def _save_docx_pages(self, path: str) -> None:
         """Uloží DOCX rozdělený podle skutečných naskenovaných stránek (page break pouze mezi stránkami)."""
         doc = Document()
-        pages = self._get_docx_pages()
+        pages = self.get_export_pages()
         total = len(pages)
         for idx, page_text in enumerate(pages):
             # Rozděl na odstavce podle dvojitého odřádkování, ale bez přidávání page break mezi odstavci
