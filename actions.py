@@ -36,9 +36,10 @@ class ScanAllAction(BaseAction):
     def run(self, ctx: PipelineContext, app: ScanApp) -> None:
         old_batch = app.batch_cb.isChecked()
         app.batch_cb.setChecked(True)
-        app.scan_pages()
+        outcome = app.scan_pages()
         app.batch_cb.setChecked(old_batch)
         ctx.images = list(app.scanned_images)
+        _handle_scan_outcome(ctx, app, outcome)
 
 
 class ScanAction(BaseAction):
@@ -47,8 +48,44 @@ class ScanAction(BaseAction):
     description = "Naskenuje jednu stránku. Po každé se zeptá, zda přidat další."
 
     def run(self, ctx: PipelineContext, app: ScanApp) -> None:
-        app.scan_pages()
+        outcome = app.scan_pages()
         ctx.images = list(app.scanned_images)
+        _handle_scan_outcome(ctx, app, outcome)
+
+
+def _handle_scan_outcome(ctx: PipelineContext, app: ScanApp, outcome: str | None) -> None:
+    """Po chybě nebo zrušení nenechá makro potichu přejít na další krok."""
+    if outcome not in {"error", "cancelled", "user_finished"}:
+        return
+
+    count = len(ctx.images)
+    reason = {
+        "error": "chybou",
+        "cancelled": "zrušeno uživatelem",
+        "user_finished": "ukončeno uživatelem",
+    }[outcome]
+    msg = QMessageBox(app)
+    msg.setWindowTitle("Skenování přerušeno")
+    msg.setText(f"Skenování bylo přerušeno ({reason}).")
+    msg.setInformativeText(
+        f"Dosud je k dispozici {count} {'stránka' if count == 1 else 'stránek'}. "
+        "Co chcete udělat s makrem?"
+    )
+    btn_scan = msg.addButton("Pokračovat ve skenování", QMessageBox.ButtonRole.AcceptRole)
+    btn_scan.setAccessibleName("Pokračovat ve skenování")
+    btn_ocr = msg.addButton("Pokračovat na OCR", QMessageBox.ButtonRole.ActionRole)
+    btn_ocr.setAccessibleName("Použít dosavadní stránky a pokračovat na OCR")
+    btn_stop = msg.addButton("Ukončit makro", QMessageBox.ButtonRole.DestructiveRole)
+    btn_stop.setAccessibleName("Ukončit makro")
+    msg.setDefaultButton(btn_stop)
+    msg.exec()
+
+    if msg.clickedButton() == btn_scan:
+        next_outcome = app.scan_pages()
+        ctx.images = list(app.scanned_images)
+        _handle_scan_outcome(ctx, app, next_outcome)
+    elif msg.clickedButton() == btn_stop:
+        ctx.cancelled = True
 
 
 class PreprocessAction(BaseAction):

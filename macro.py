@@ -107,7 +107,7 @@ class PipelineRunner:
     def __init__(self, app: ScanApp) -> None:
         self.app = app
 
-    def run(self, macro: Macro) -> None:
+    def run(self, macro: Macro) -> bool:
         ctx = PipelineContext()
         for i, step in enumerate(macro.steps):
             if ctx.cancelled:
@@ -118,3 +118,4 @@ class PipelineRunner:
                 continue
             self.app.speak(f"Krok {i + 1}: {action.name}")
             action.run(ctx, self.app)
+        return not ctx.cancelled

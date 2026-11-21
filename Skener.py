@@ -2035,7 +2035,9 @@ class ScanApp(QWidget):
             QMessageBox.critical(self, "Chyba", f"Nenašel jsem žádný skener:\n{e}")
 
     # ---------- Scanning ----------
-    def scan_pages(self) -> None:
+    def scan_pages(self) -> str:
+        # Makra potřebují rozlišit běžné ukončení od chyby nebo zrušení.
+        self._scan_outcome = "completed"
         # If pages already exist, never clear without confirmation.
         if self.scanned_images:
             count = len(self.scanned_images)
@@ -2055,8 +2057,9 @@ class ScanApp(QWidget):
             clicked = msg.clickedButton()
             if clicked == btn_append:
                 self.scan_next_page()
-                return
+                return getattr(self, "_scan_outcome", "completed")
             if clicked != btn_new:
+                self._scan_outcome = "cancelled"
                 speak("Skenování zrušeno, stránky zachovány.")
                 self.page_list.setFocus()
                 return
@@ -2112,6 +2115,7 @@ class ScanApp(QWidget):
             btn_no.setAccessibleName("Ne, ukončit skenování")
             msg.exec()
             if msg.clickedButton() != btn_yes:
+                self._scan_outcome = "user_finished"
                 break
 
         if self.scanned_images:
@@ -2128,6 +2132,8 @@ class ScanApp(QWidget):
             self._update_save_button_state()
             speak("Skenování dokončeno, žádné stránky.")
 
+        return getattr(self, "_scan_outcome", "completed")
+
     def scan_next_page(self) -> None:
         speak("Přidávám další stránku ke stávajícímu dokumentu.")
         count_before = len(self.scanned_images)
@@ -2136,6 +2142,8 @@ class ScanApp(QWidget):
         self._do_scan_single()
 
         if self._scan_cancelled or self.last_scanned_image is None:
+            if getattr(self, "_scan_outcome", "completed") == "completed":
+                self._scan_outcome = "cancelled"
             speak("Skenování další stránky zrušeno.")
             if self.scanned_images:
                 self.page_list.setFocus()
@@ -2247,6 +2255,7 @@ class ScanApp(QWidget):
 
     def _cancel_scan(self) -> None:
         self._scan_cancelled = True
+        self._scan_outcome = "cancelled"
         speak("Skenování zrušeno.")
 
     def _scan_finished(self, img: Image.Image) -> None:
@@ -2265,10 +2274,12 @@ class ScanApp(QWidget):
             self.scanned_images.append(processed)
             self.last_scanned_image = processed
         else:
+            self._scan_outcome = "cancelled"
             self.last_scanned_image = None
 
     def _scan_error(self, msg: str) -> None:
         self.progress_dialog.cancel()
+        self._scan_outcome = "error"
         speak(f"Chyba skenování: {msg}")
         QMessageBox.critical(self, "Chyba skenování", msg)
         self.last_scanned_image = None
@@ -3809,8 +3820,8 @@ class ScanApp(QWidget):
 
     def _run_macro(self, macro: Macro) -> None:
         self.speak(f"Spouštím makro: {macro.name}")
-        self._macro_runner.run(macro)
-        self.speak("Makro dokončeno.")
+        completed = self._macro_runner.run(macro)
+        self.speak("Makro dokončeno." if completed else "Makro ukončeno.")
 
     def _rename_macro(self, macro: Macro) -> None:
         new_name, ok = QInputDialog.getText(
