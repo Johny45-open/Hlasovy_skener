@@ -167,47 +167,359 @@ def _insert_ocr_textbox_invisible(page: "fitz.Page", rect: "fitz.Rect",
         return "failed"
 
 
-def _insert_confirmed_page_layer(page: "fitz.Page", text: str,
-                                     fontname: str) -> str:
-    """Vloží celou potvrzenou textovou vrstvu přes dostupnou plochu stránky.
+# ------------------ Potvrzená vrstva: dělení a pokračovací stránky ----------
+# První textový kus míří na zdrojovou (naskenovanou) stránku A: neviditelná
+# vrstva (render_mode=3), okraje _OCR_PDF_CONFIRMED_MARGIN, smyčka 11->4 pt.
+# Každý další kus míří na pokračovací stránku B: viditelný černý text
+# (render_mode=0) pod nadpisem "Pokračování textu stránky N". Měření kapacity
+# probíhá vždy na ČISTÉ scratch stránce se stejnou geometrií, fontem,
+# velikostí písma a render režimem jako finální zápis.
 
-    Samostatná explicitní cesta pro změněné stránky – nepoužívá bbox=None
-    fallback do spodního pruhu. Vrací 'ok' | 'shrunk' | 'failed'.
-    'failed' znamená, že se text nevešel ani při minimální velikosti písma;
-    volající pak export přeruší (žádné potiché ořezání, žádný text mimo stránku).
-    Prázdný text vrstvu nevytváří (obraz zůstává), vrací 'ok'.
+
+def _confirmed_continuation_heading(page_number: int) -> str:
+    """Text nadpisu pokračovací stránky pro zdrojovou stránku (1-based)."""
+    return f"Pokračování textu stránky {int(page_number)}"
+
+
+def _confirmed_tokens(text: str) -> list:
+    """Tokenizace se zachováním všech bílých znaků (bezztrátové).
+
+    Invariant: ''.join(výsledek) == text. Mezery, explicitní zalomení řádků
+    i prázdné odstavce jsou samostatné tokeny a nikde se nepřesouvají.
     """
-    if not text or not str(text).strip():
-        return "ok"
-    text = str(text)
+    return re.findall(r"\s+|\S+", text)
+
+
+def _confirmed_margin(w: float, h: float) -> Optional[float]:
+    """Okraj textové oblasti potvrzené vrstvy; None = stránka je příliš malá."""
     margin = _OCR_PDF_CONFIRMED_MARGIN
-    try:
-        w, h = float(page.rect.width), float(page.rect.height)
-    except Exception:
-        return "failed"
     if w <= 2 * margin or h <= 2 * margin:
-        # Velmi malá stránka – zmenši okraje, ale nikdy ne mimo stránku.
         margin = max(4.0, min(w, h) / 8.0)
         if w <= 2 * margin or h <= 2 * margin:
-            return "failed"
-    rect = fitz.Rect(margin, margin, w - margin, h - margin)
-    fs = _OCR_PDF_CONFIRMED_START_FONTSIZE
-    shrunk = False
-    while True:
+            return None
+    return margin
+
+
+def _font_line_height(fontfile: str, fontsize: float) -> float:
+    """Výška řádku fontu v bodech (z metrik fontu, ne odhadem)."""
+    fnt = fitz.Font(fontfile=fontfile)
+    return max(1.0, (fnt.ascender - fnt.descender) * float(fontsize))
+
+
+def _probe_confirmed_fit(page_size, rect, text: str, fontsize: float,
+                         fontname: str, fontfile: str, render_mode: int,
+                         heading: Optional[str] = None,
+                         heading_rect=None,
+                         heading_fs: Optional[float] = None) -> bool:
+    """Zkušební vložení na ČISTÉ scratch stránce (nikdy do výstupního dokumentu).
+
+    Každý pokus vytvoří zbrusu novou stránku se stejným rozměrem jako cílová;
+    stránka, na kterou už byl úspěšně vložen předchozí kandidát, se nikdy
+    nepoužije znovu. `heading` (typ B) se vloží předem stejným voláním jako
+    na výstup – pouze jako příprava prostředí, nikoli jako náhrada měření těla.
+    """
+    if not text:
+        return True
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=float(page_size[0]), height=float(page_size[1]))
+        page.insert_font(fontname=fontname, fontfile=fontfile)
+        if heading is not None:
+            ret = page.insert_textbox(heading_rect, heading, fontsize=heading_fs,
+                                      fontname=fontname, render_mode=0)
+            if ret is None or ret < 0:
+                return False
+        ret = page.insert_textbox(rect, text, fontsize=fontsize,
+                                  fontname=fontname, render_mode=render_mode)
+        return ret is not None and ret >= 0
+    except Exception as e:
+        logger.warning("Potvrzená PDF vrstva: zkušební vložení selhalo: %s", e)
+        return False
+    finally:
         try:
-            ret = page.insert_textbox(rect, text, fontsize=fs,
-                                      fontname=fontname, render_mode=3)
-        except Exception as e:
-            logger.warning("Potvrzená PDF vrstva insert_textbox selhal (fs=%.2f): %s", fs, e)
-            ret = -1.0
-        if ret is not None and ret >= 0:
-            return "shrunk" if shrunk else "ok"
+            doc.close()
+        except Exception:
+            pass
+
+
+def _plan_continuation_geometry(page_size, fontname: str, fontfile: str,
+                                heading: str) -> dict:
+    """Vypočte geometrii pokračovací stránky: rect_head, head_fs, rect_body.
+
+    - šířka nadpisu se kontroluje přes fitz.Font.text_length(),
+    - umístění nadpisu se ověří SKUTEČNÝM vložením nadpisu na scratch stránku
+      (zóna se max 5× zvětší; stále ne → RuntimeError),
+    - rect_body.y0 leží pod nadpisovou zónou i pod rezervou prázdného řádku
+      (kontroluje se asercí).
+    """
+    w, h = float(page_size[0]), float(page_size[1])
+    margin = _confirmed_margin(w, h)
+    if margin is None:
+        raise RuntimeError(
+            "Stránka je příliš malá pro pokračovací textovou vrstvu. "
+            "PDF nebylo vytvořeno.")
+    usable_w = w - 2 * margin
+    fnt = fitz.Font(fontfile=fontfile)
+    # Velikost nadpisu: smyčka 11->4 pt; šířka přes text_length().
+    head_fs = None
+    fs = _OCR_PDF_CONFIRMED_START_FONTSIZE
+    while True:
+        if fnt.text_length(heading, fontsize=fs) <= usable_w:
+            head_fs = fs
+            break
         next_fs = max(_OCR_PDF_MIN_FONTSIZE, fs * _OCR_PDF_SHRINK_FACTOR)
         if next_fs >= fs:
-            logger.error("Potvrzená PDF vrstva: text se nevešel ani při fs=%.2f.", fs)
-            return "failed"
+            break
         fs = next_fs
-        shrunk = True
+    if head_fs is None:
+        raise RuntimeError(
+            f"Nadpis pokračování ({heading!r}) se nevejde do šířky stránky – "
+            f"PDF nebylo vytvořeno.")
+    line_h = _font_line_height(fontfile, head_fs)
+    head_h = line_h * 2.0  # nadpis + bezpečná rezerva zóny
+    rect_head = None
+    placed = False
+    for _ in range(5):
+        rect_head = fitz.Rect(margin, margin, w - margin, margin + head_h)
+        if _probe_confirmed_fit((w, h), rect_head, heading, head_fs,
+                                fontname, fontfile, 0):
+            placed = True
+            break
+        head_h *= 1.2
+    if not placed:
+        raise RuntimeError(
+            "Nadpis pokračování se nepodařilo bezpečně umístit na stránku – "
+            "PDF nebylo vytvořeno.")
+    # Tělo začíná pod nadpisovou zónou i pod rezervou prázdného řádku.
+    rect_body = fitz.Rect(margin, rect_head.y1 + line_h, w - margin, h - margin)
+    if rect_body.y0 < rect_head.y1 + line_h - 1e-6:
+        raise RuntimeError(
+            "Vnitřní chyba geometrie pokračovací stránky. PDF nebylo vytvořeno.")
+    if rect_body.height < _font_line_height(fontfile, _OCR_PDF_MIN_FONTSIZE):
+        raise RuntimeError(
+            "Stránka je příliš malá pro text pokračování – PDF nebylo vytvořeno.")
+    return {"rect_head": rect_head, "head_fs": float(head_fs),
+            "rect_body": rect_body, "line_h": line_h}
+
+
+def _plan_confirmed_chunks(page_size, text: str, fontname: str,
+                           fontfile: str, page_number: int):
+    """Rozdělí potvrzený text na kusy pro stránku A a pokračovací stránky B.
+
+    Bezztrátové: ''.join(chunk['text'] ...) == text. První kus se měří vůči
+    oblasti zdrojové stránky (render 3, smyčka 11->4 pt), každý další vůči
+    rect_body pokračovací stránky (render 0, nadpis vložen předem na scratch).
+    Každá iterace spotřebí ≥1 token nebo zkrátí zbývající bílý token o ≥1 znak
+    (ochrana proti zacyklení). Vrací (chunks, geom_b); geom_b je None,
+    nevznikla-li pokračovací stránka.
+    """
+    w, h = float(page_size[0]), float(page_size[1])
+    margin = _confirmed_margin(w, h)
+    if margin is None:
+        raise RuntimeError(
+            "Stránka je příliš malá pro potvrzenou textovou vrstvu. "
+            "PDF nebylo vytvořeno.")
+    rect_a = fitz.Rect(margin, margin, w - margin, h - margin)
+
+    # 1) Celý text na zdrojovou stránku (dosavadní chování), smyčka 11->4 pt.
+    fs = _OCR_PDF_CONFIRMED_START_FONTSIZE
+    while True:
+        if _probe_confirmed_fit((w, h), rect_a, text, fs, fontname, fontfile, 3):
+            return [{"text": text, "fontsize": float(fs), "kind": "A",
+                     "rect": rect_a}], None
+        next_fs = max(_OCR_PDF_MIN_FONTSIZE, fs * _OCR_PDF_SHRINK_FACTOR)
+        if next_fs >= fs:
+            break
+        fs = next_fs
+
+    # 2) Dělení na kusy (A -> první kus, B -> pokračování).
+    tokens = _confirmed_tokens(text)
+    geom_b = None
+    chunks: list = []
+
+    def _fits(kind: str, fs_: float, cand: str) -> bool:
+        if kind == "A":
+            return _probe_confirmed_fit((w, h), rect_a, cand, fs_, fontname,
+                                        fontfile, 3)
+        return _probe_confirmed_fit((w, h), geom_b["rect_body"], cand, fs_,
+                                    fontname, fontfile, 0,
+                                    heading=geom_b["heading"],
+                                    heading_rect=geom_b["rect_head"],
+                                    heading_fs=geom_b["head_fs"])
+
+    def _max_tokens(kind: str, fs_: float) -> int:
+        """Největší k>=1 takové, že tokens[i:i+k] se vejdou; 0 = ani tokens[i]."""
+        if not _fits(kind, fs_, tokens[i]):
+            return 0
+        rem = len(tokens) - i
+        lo, step = 1, 1
+        while lo + step <= rem and _fits(kind, fs_, "".join(tokens[i:i + lo + step])):
+            lo += step
+            step *= 2
+        hi = min(rem, lo + step)
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if _fits(kind, fs_, "".join(tokens[i:i + mid])):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _chunk_rect(kind: str):
+        return rect_a if kind == "A" else geom_b["rect_body"]
+
+    def _max_prefix(kind: str, fs_: float, token: str) -> int:
+        """Největší L>=1 takové, že prefix token[:L] se vejde; 0 = ani 1 znak."""
+        if not _fits(kind, fs_, token[:1]):
+            return 0
+        lo, step = 1, 1
+        while lo + step <= len(token) and _fits(kind, fs_, token[:lo + step]):
+            lo += step
+            step *= 2
+        hi = min(len(token), lo + step)
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if _fits(kind, fs_, token[:mid]):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    i = 0
+    while i < len(tokens):
+        kind = "A" if not chunks else "B"
+        if kind == "B" and geom_b is None:
+            heading = _confirmed_continuation_heading(page_number)
+            geom_b = _plan_continuation_geometry((w, h), fontname, fontfile, heading)
+            geom_b["heading"] = heading
+        i_before, len_before = i, len(tokens[i])
+        k = _max_tokens(kind, _OCR_PDF_CONFIRMED_START_FONTSIZE)
+        if k >= 1:
+            chunks.append({"text": "".join(tokens[i:i + k]),
+                           "fontsize": float(_OCR_PDF_CONFIRMED_START_FONTSIZE),
+                           "kind": kind, "rect": _chunk_rect(kind)})
+            i += k
+        else:
+            # Token se nevejde ani při 11 pt: nejdřív zkus pro tento kus
+            # zmenšit písmo (10->4 pt).
+            placed_fs = None
+            f = _OCR_PDF_CONFIRMED_START_FONTSIZE
+            while True:
+                nf = max(_OCR_PDF_MIN_FONTSIZE, f * _OCR_PDF_SHRINK_FACTOR)
+                if nf >= f:
+                    break
+                f = nf
+                if _fits(kind, f, tokens[i]):
+                    placed_fs = f
+                    break
+            if placed_fs is not None:
+                chunks.append({"text": tokens[i], "fontsize": float(placed_fs),
+                               "kind": kind, "rect": _chunk_rect(kind)})
+                i += 1
+            elif not tokens[i].isspace() and len(tokens[i]) > 1:
+                # Nerozdělitelné slovo delší než prázdná oblast -> znakové
+                # dělení (bezztrátové, žádný znak se neztratí).
+                logger.warning("Potvrzená PDF vrstva: slovo %r rozděleno na "
+                               "znaky (nevejde se na stránku).", tokens[i][:40])
+                tokens[i:i + 1] = list(tokens[i])
+            else:
+                # Bílý token delší než prázdná oblast -> rozdělit na přesné
+                # části; nejmenší písmo = největší kapacita.
+                lp = _max_prefix(kind, _OCR_PDF_MIN_FONTSIZE, tokens[i])
+                if lp < 1:
+                    raise RuntimeError(
+                        f"Bílý textový token (délka {len(tokens[i])}) se "
+                        f"nepodařilo rozdělit na stránce {page_number}. "
+                        f"PDF nebylo vytvořeno.")
+                chunks.append({"text": tokens[i][:lp],
+                               "fontsize": float(_OCR_PDF_MIN_FONTSIZE),
+                               "kind": kind, "rect": _chunk_rect(kind)})
+                tokens[i] = tokens[i][lp:]
+        # Ochrana proti zacyklení: každá iterace musí spotřebovat token
+        # nebo zkrátit zbývající část tokenu.
+        if i == i_before and len(tokens[i]) == len_before:
+            raise RuntimeError(
+                "Dělení potvrzeného textu nepokročilo (vnitřní chyba). "
+                "PDF nebylo vytvořeno.")
+
+    if "".join(c["text"] for c in chunks) != text:
+        raise RuntimeError(
+            "Dělení potvrzeného textu nebylo bezztrátové (vnitřní chyba). "
+            "PDF nebylo vytvořeno.")
+    return chunks, geom_b
+
+
+def _verify_confirmed_groups(vdoc, groups: list) -> None:
+    """Ověří úplnost textu per skupina (zdrojová stránka + její pokračování).
+
+    Nadpis pokračovací stránky se z extraktu odečte (nesmí být součástí
+    potvrzeného textu). Porovnává se text BEZ bílých znaků: PDF textový proud
+    může oříznout koncové bílé znaky a MuPDF vkládá zalomení i dovnitř
+    zlomeného (nerozdělitelného) slova – tyto rozdíly nejsou ztrátou obsahu.
+    Přesná bezztrátovost včetně bílých znaků se dokazuje na úrovni splitteru
+    (testy), zde jde o detekci zkrácení, chybějícího, duplicitního či
+    přehozeného textu.
+    """
+    for g in groups:
+        parts: list = []
+        for idx in g["pages"]:
+            t = vdoc[idx].get_text()
+            if idx != g["source"]:
+                first, sep, rest = t.partition("\n")
+                if first.strip() != g["heading"]:
+                    raise RuntimeError(
+                        f"Ověření PDF selhalo: na stránce {idx + 1} chybí "
+                        f"nadpis pokračování {g['heading']!r}. "
+                        f"PDF nebylo vytvořeno.")
+                t = rest if sep else ""
+            parts.append(t)
+        got = re.sub(r"\s+", "", "".join(parts))
+        exp = re.sub(r"\s+", "", g["expected"])
+        if got != exp:
+            raise RuntimeError(
+                f"Ověření PDF selhalo: textová vrstva stránky {g['source'] + 1} "
+                f"(včetně pokračování) neodpovídá potvrzenému textu. "
+                f"PDF nebylo vytvořeno.")
+
+
+def _atomic_save_and_verify(doc, output_path: str, expected_pages: int,
+                            verify_fn: Callable) -> None:
+    """Uloží do tmp v cílovém adresáři, znovu otevře, ověří a atomicky nahradí cíl.
+
+    Při jakémkoli selhání (save, ověření, replace) zůstane případný původní
+    cílový soubor nedotčený a dočasný soubor se ukliď.
+    """
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".pdf.tmp")
+    os.close(fd)
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)  # fitz save vyžaduje volnou cestu
+        doc.save(tmp_path)
+        try:
+            doc.close()
+        except Exception:
+            pass
+        vdoc = fitz.open(tmp_path)
+        try:
+            if vdoc.page_count != int(expected_pages):
+                raise RuntimeError(
+                    f"Ověření PDF selhalo: počet stránek {vdoc.page_count} "
+                    f"neodpovídá {expected_pages}. PDF nebylo vytvořeno.")
+            verify_fn(vdoc)
+        finally:
+            try:
+                vdoc.close()
+            except Exception:
+                pass
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def build_searchable_pdf(images: list[Image.Image],
@@ -219,15 +531,21 @@ def build_searchable_pdf(images: list[Image.Image],
 
     Testovatelná bez Qt. Zachovává převod px->pt (x/dpi*72) i konzistenci
     OCR-obraz vs. PDF-obraz (volající předává stejné objekty).
-    Statistiky: {pages, inserted, shrunk, fallback, failed, nobbox, confirmed}.
+    Statistiky: {pages, inserted, shrunk, fallback, failed, nobbox, confirmed,
+    continuation, continued_pages, output_pages}.
 
     confirmed_override: volitelný per-page přepis (stejná délka jako images).
     Prvek None = nezměněná stránka (původní word-level vrstva).
     Prvek str = změněná stránka: použije se VÝHRADNĚ explicitní potvrzená
-    vrstva přes celou plochu stránky, staré OCR položky se nevkládají
-    (žádná duplicita). Nevejde-li se text ani při minimální velikosti,
-    export se přeruší výjimkou RuntimeError a PDF nevznikne (žádné
-    neúplné PDF, žádný text mimo stránku).
+    vrstva, staré OCR položky se nevkládají (žádná duplicita). Nevejde-li se
+    celý text na stránku ani při minimální velikosti písma, rozdělí se
+    bezztrátově na části: první zůstane na zdrojové stránce (neviditelná
+    vrstva), zbytek se uloží na pokračovacích stránkách (viditelný text
+    pod nadpisem "Pokračování textu stránky N") hned za zdrojovou stránkou.
+    Výsledek se uloží do dočasného souboru, znovu otevře a ověří (počet
+    stránek i úplnost textu per skupina); teprve poté se atomicky nahradí
+    cíl. Selže-li cokoli, cílový soubor zůstane nedotčený, dočasný soubor
+    se ukliď a export skončí výjimkou RuntimeError.
     """
     if dpi is None or int(dpi) <= 0:
         dpi = 300
@@ -241,13 +559,15 @@ def build_searchable_pdf(images: list[Image.Image],
             "(assets/fonts/DejaVuSans.ttf). Přeinstalujte aplikaci."
         )
     stats = {"pages": 0, "inserted": 0, "shrunk": 0,
-              "fallback": 0, "failed": 0, "nobbox": 0, "confirmed": 0}
+              "fallback": 0, "failed": 0, "nobbox": 0, "confirmed": 0,
+              "continuation": 0, "continued_pages": [], "output_pages": 0}
     if confirmed_override is not None and len(confirmed_override) != len(images):
         raise ValueError(
             "confirmed_override musí mít stejný počet stránek jako images "
             f"({len(confirmed_override)} != {len(images)})."
         )
     doc = fitz.open()
+    groups: list = []  # skupiny změněných stránek pro ověření úplnosti
     try:
         for i, img in enumerate(images):
             page = doc.new_page(width=img.width / dpi * 72,
@@ -275,20 +595,79 @@ def build_searchable_pdf(images: list[Image.Image],
             if confirmed_override is not None and confirmed_override[i] is not None:
                 confirmed_text = confirmed_override[i]
                 if confirmed_text and str(confirmed_text).strip():
-                    res = _insert_confirmed_page_layer(
-                        page, confirmed_text, _OCR_PDF_FONTNAME)
-                    if res in ("ok", "shrunk"):
-                        stats["inserted"] += 1
-                        stats["confirmed"] += 1
-                    if res == "shrunk":
-                        stats["shrunk"] += 1
-                    elif res == "failed":
+                    confirmed_text = str(confirmed_text)
+                    page_size = (page.rect.width, page.rect.height)
+                    try:
+                        chunks, geom_b = _plan_confirmed_chunks(
+                            page_size, confirmed_text, _OCR_PDF_FONTNAME,
+                            fontfile, i + 1)
+                    except RuntimeError:
                         stats["failed"] += 1
-                        raise RuntimeError(
-                            f"Potvrzený text stránky {i + 1} se nevešel do textové "
-                            f"vrstvy ani při minimální velikosti písma. "
-                            f"PDF nebylo vytvořeno."
-                        )
+                        raise
+                    # Předzápisová kontrola: každý kus se ověří na ČISTÉ
+                    # scratch stránce se stejnou geometrií, fontem, velikostí
+                    # a render režimem jako finální zápis.
+                    for ch in chunks:
+                        if ch["kind"] == "A":
+                            ok = _probe_confirmed_fit(
+                                page_size, ch["rect"], ch["text"],
+                                ch["fontsize"], _OCR_PDF_FONTNAME, fontfile, 3)
+                        else:
+                            ok = _probe_confirmed_fit(
+                                page_size, geom_b["rect_body"], ch["text"],
+                                ch["fontsize"], _OCR_PDF_FONTNAME, fontfile, 0,
+                                heading=geom_b["heading"],
+                                heading_rect=geom_b["rect_head"],
+                                heading_fs=geom_b["head_fs"])
+                        if not ok:
+                            stats["failed"] += 1
+                            raise RuntimeError(
+                                f"Potvrzený text stránky {i + 1} se nepodařilo "
+                                f"bezpečně umístit do textové vrstvy. "
+                                f"PDF nebylo vytvořeno.")
+                    # Finální zápis: na každou stránku právě jednou.
+                    source_index = doc.page_count - 1
+                    group_pages = [source_index]
+                    for ch in chunks:
+                        if ch["kind"] == "A":
+                            target = page
+                        else:
+                            target = doc.new_page(width=page_size[0],
+                                                  height=page_size[1])
+                            target.insert_font(fontname=_OCR_PDF_FONTNAME,
+                                               fontfile=fontfile)
+                            hret = target.insert_textbox(
+                                geom_b["rect_head"], geom_b["heading"],
+                                fontsize=geom_b["head_fs"],
+                                fontname=_OCR_PDF_FONTNAME, render_mode=0)
+                            if hret is None or hret < 0:
+                                stats["failed"] += 1
+                                raise RuntimeError(
+                                    f"Nadpis pokračování stránky {i + 1} se "
+                                    f"nepodařilo zapsat. PDF nebylo vytvořeno.")
+                            group_pages.append(doc.page_count - 1)
+                            stats["continuation"] += 1
+                        ret = target.insert_textbox(
+                            ch["rect"], ch["text"], fontsize=ch["fontsize"],
+                            fontname=_OCR_PDF_FONTNAME,
+                            render_mode=3 if ch["kind"] == "A" else 0)
+                        if ret is None or ret < 0:
+                            stats["failed"] += 1
+                            raise RuntimeError(
+                                f"Potvrzený text stránky {i + 1} se nepodařilo "
+                                f"zápisem umístit do textové vrstvy. "
+                                f"PDF nebylo vytvořeno.")
+                        stats["inserted"] += 1
+                        if ch["fontsize"] < _OCR_PDF_CONFIRMED_START_FONTSIZE - 1e-9:
+                            stats["shrunk"] += 1
+                    stats["confirmed"] += 1
+                    if len(group_pages) > 1:
+                        stats["continued_pages"].append(i)
+                    groups.append({
+                        "source": source_index, "pages": group_pages,
+                        "expected": confirmed_text,
+                        "heading": geom_b["heading"] if geom_b else None,
+                    })
                 continue
             nobbox_texts: list[str] = []
             if i < len(ocr_pages):
@@ -349,7 +728,21 @@ def build_searchable_pdf(images: list[Image.Image],
                     stats["fallback"] += 1
                 elif res == "failed":
                     stats["failed"] += len(nobbox_texts)
-        doc.save(output_path)
+        # Invariance statistik před zápisem.
+        stats["output_pages"] = doc.page_count
+        if stats["output_pages"] != stats["pages"] + stats["continuation"]:
+            raise RuntimeError(
+                "Nekonzistentní počet stránek při exportu PDF (vnitřní chyba). "
+                "PDF nebylo vytvořeno.")
+        if stats["continuation"] < len(stats["continued_pages"]):
+            raise RuntimeError(
+                "Nekonzistentní statistiky pokračovacích stránek (vnitřní chyba). "
+                "PDF nebylo vytvořeno.")
+        # Atomický zápis: tmp v cílovém adresáři, znovuotevření + ověření,
+        # teprve poté nahrazení cíle. Při selhání cíl zůstane nedotčený.
+        _atomic_save_and_verify(
+            doc, output_path, stats["output_pages"],
+            lambda vdoc: _verify_confirmed_groups(vdoc, groups))
     finally:
         try:
             doc.close()
@@ -1075,6 +1468,10 @@ class ScanApp(QWidget):
 
         lbl_lang = QLabel("Jazyk OCR:")
         self.lang_combo = QComboBox()
+        # Po spuštění musí být první ovládací prvek dostupný klávesnicí i
+        # čtečce obrazovky.  Explicitní policy je pojistka proti stylům,
+        # které by fokus QComboBoxu změnily.
+        self.lang_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.lang_combo.setAccessibleName("Jazyk OCR")
         self.lang_combo.addItems([
             "ces (Čeština)", "eng (Angličtina)", "deu (Němčina)",
@@ -1335,26 +1732,16 @@ class ScanApp(QWidget):
     def _set_initial_focus(self) -> None:
         if self._initial_focus_done:
             return
-        # Pokud okno ještě není aktivní (Windows activation delay), zkusit znovu
-        # – neagresivně, bez krádeže fokusu. Max 5 pokusů po 100 ms.
-        if not self.isActiveWindow():
-            # Zjistit, zda už byl pokus; uložit counter do atributu
-            tries = getattr(self, "_initial_focus_tries", 0)
-            if tries < 5:
-                self._initial_focus_tries = tries + 1
-                QTimer.singleShot(100, self._set_initial_focus)
-                return
-            # Po vyčerpání pokusů nastavit fokus i bez isActiveWindow –
-            # QWidget.setFocus() vyžaduje active window pro NVDA, ale
-            # fokus bude doručen jakmile se okno aktivuje uživatelem/WM.
-            # Nepoužívat QApplication.setActiveWindow() (deprecated) ani
-            # agresivní activateWindow() pokud uživatel mezitím přešel jinam.
-        # Nepoužívat zastaralé QApplication.setActiveWindow().
-        # activateWindow() pouze pokud je to bezpečné a okno je viditelné,
-        # ale nekrást fokus – proto jen pokud je okno viditelné a ještě neaktivní
-        # a uživatel zjevně aplikaci právě spustil (první show).
-        # V praxi stačí setFocus; Windows dá aktivaci automaticky při spuštění.
+        # Windows může aktivaci okna dokončit až po několika průchodech event
+        # loopu.  SetFocus samo o sobě nestačí: ověříme, že fokus skutečně
+        # skončil na comboboxu, jinak čtečka nedostane spolehlivý Focus event.
         self.lang_combo.setFocus(Qt.FocusReason.OtherFocusReason)
+        if not self.lang_combo.hasFocus():
+            tries = getattr(self, "_initial_focus_tries", 0) + 1
+            self._initial_focus_tries = tries
+            if tries < 20:
+                QTimer.singleShot(100, self._set_initial_focus)
+            return
         # Qt interně pošle QAccessible::Focus event přes UIA bridge.
         # Explicitní QAccessible.updateAccessibility() by bylo duplicitní
         # a v PyQt6 6.11 není QAccessible v Python API vůbec exponován.
